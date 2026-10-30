@@ -48,6 +48,8 @@ docker compose down
 
 To start again, run `docker compose up --build --wait` from the same directory. Skip the bootstrap command when `.env` already exists; its refusal to overwrite that file is expected. Keep the existing credentials with the existing database volume.
 
+Do not commit the generated `.env`, production secret files, database dumps, or exported workspaces; the ignore rules cover their designated directories.
+
 The named PostgreSQL volume survives `down`. Use `down -v` only when deliberately deleting this local development database. Production uses a separate configuration below.
 
 If startup fails:
@@ -56,22 +58,6 @@ If startup fails:
 - **Cannot connect to the Docker daemon:** start Docker Desktop or the Linux Docker service and wait for `docker info` to succeed.
 - **Port 8080 is already in use:** change `HTTP_PORT=8080` to `HTTP_PORT=8081` in `.env`, rerun the startup command, and use port 8081 in the browser and health-check URL.
 - **Migration failure or app not healthy:** inspect `docker compose ps -a` and `docker compose logs migrate app db`. Fix the reported issue and rerun startup; do not delete the volume or regenerate credentials as a first troubleshooting step.
-
-## What to upload to GitHub
-
-Upload the **contents of this directory** into the repository root, including hidden `.github`, `.gitignore`, and `.dockerignore` files. The supplied ZIP contains this directory as its top-level folder; extract it before uploading. Git is preferable to browser upload so hidden files are included.
-
-For a new repository, after the hosting team gives you its URL:
-
-```sh
-git init -b main
-git add .
-git commit -m "Add ASIC Tracker frontend, Python API, and PostgreSQL deployment"
-git remote add origin <repository-url-from-hosting-team>
-git push -u origin main
-```
-
-Do not commit the generated `.env`, production secret files, database dumps, or exported workspaces; the ignore rules cover their designated directories.
 
 ## Package layout
 
