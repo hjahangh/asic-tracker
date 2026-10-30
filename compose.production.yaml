@@ -1,0 +1,50 @@
+# Standalone production template. Do not combine with the development compose.yaml.
+# The hosting team supplies PostgreSQL, TLS, SSO gateway, secrets and backups.
+x-runtime: &runtime
+  image: ${ASIC_TRACKER_IMAGE:?Set the internally approved image}
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  init: true
+
+services:
+  migrate:
+    <<: *runtime
+    command: [alembic, upgrade, head]
+    environment:
+      DATABASE_URL_FILE: /run/secrets/migration_database_url
+    secrets:
+      - migration_database_url
+    healthcheck:
+      disable: true
+    restart: "no"
+
+  app:
+    <<: *runtime
+    environment:
+      DATABASE_URL_FILE: /run/secrets/runtime_database_url
+      PROXY_SHARED_SECRET_FILE: /run/secrets/proxy_shared_secret
+      AUTH_MODE: proxy
+      TRUSTED_HOSTS: ${TRACKER_HOSTNAME:?Set the approved internal hostname},localhost,127.0.0.1
+      ROLE_GROUPS: '${ROLE_GROUPS:?Set the approved group mappings}'
+      ENABLE_API_DOCS: "false"
+    secrets:
+      - runtime_database_url
+      - proxy_shared_secret
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-8080}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+secrets:
+  runtime_database_url:
+    file: ${DATABASE_URL_SECRET_FILE:?Set the runtime database URL secret file}
+  migration_database_url:
+    file: ${MIGRATION_DATABASE_URL_SECRET_FILE:?Set the migration database URL secret file}
+  proxy_shared_secret:
+    file: ${PROXY_SHARED_SECRET_FILE:?Set the trusted gateway secret file}

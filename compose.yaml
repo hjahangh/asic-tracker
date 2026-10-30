@@ -1,0 +1,57 @@
+# Local development only: explicit development identity and a loopback web port.
+x-application: &application
+  image: asic-tracker:local
+  build: .
+  environment: &development-environment
+    DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-asic_tracker_dev}:${POSTGRES_PASSWORD:?Run python3 scripts/bootstrap_dev.py first}@db:5432/${POSTGRES_DB:-asic_tracker_dev}
+    AUTH_MODE: development
+    DEV_USER: local-developer
+    DEV_ROLE: admin
+    TRUSTED_HOSTS: localhost,127.0.0.1
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  init: true
+
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-asic_tracker_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-asic_tracker_dev}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run python3 scripts/bootstrap_dev.py first}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+
+  migrate:
+    <<: *application
+    command: [alembic, upgrade, head]
+    healthcheck:
+      disable: true
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    <<: *application
+    ports:
+      - "127.0.0.1:${HTTP_PORT:-8080}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
