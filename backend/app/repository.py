@@ -1,28 +1,25 @@
-"""Atomic relational persistence for the browser's workspace transaction API.
+"""MongoDB workspace persistence with snapshot reads and revision-serialized writes.
 
-The caller owns the SQLAlchemy transaction. The singleton revision row serializes
-writes; stale revisions raise RevisionConflict before any business row is changed.
+Every entity has its own document. Forecast rows and recovery/audit payloads are
+split so the workspace never needs to fit in one BSON document. The runtime
+account can only find/insert audit records; ordinary synchronization never edits
+or deletes those collections.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import uuid
-from datetime import date, datetime, timezone
-from decimal import Decimal
+from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func, select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.orm import Session
+from bson import BSON
+from bson.errors import InvalidDocument
+from pymongo import ReplaceOne
 
-from .models import (
-    ASIC, ASICPart, ASICPriceHistory, AuditEntry, BusinessEntity, ForecastLine,
-    ForecastVersion, FundingSource, PlanningEvent, Project, ProjectASIC,
-    ProjectFamily, RecoverySnapshot, WorkspaceMeta,
-)
-
+from .database import (CHUNK_BYTES, ENTITY_COLLECTIONS, MAX_DOCUMENT_BYTES,
+                       ORDINARY_COLLECTIONS, SCHEMA_COLLECTION, SCHEMA_DOCUMENT_ID,
+                       SCHEMA_VERSION, run_transaction)
 
 STATE_ARRAYS = (
     "asics", "projects", "projectFamilies", "events", "businessEntities",
@@ -36,271 +33,189 @@ class RevisionConflict(Exception):
         super().__init__("The workspace changed. Reload the latest revision before retrying.")
 
 
+class StorageValidationError(ValueError):
+    """A workspace value cannot safely be represented in MongoDB."""
+
+
+class StorageIntegrityError(RuntimeError):
+    """Persisted chunk data is missing or corrupt."""
+
+
+class SchemaNotReadyError(RuntimeError):
+    """Owner bootstrap or a schema migration must run before serving data."""
+
+
 def _copy(value: Any) -> Any:
-    return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
+    try:
+        encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
+        encoded.encode("utf-8")
+        return json.loads(encoded)
+    except (ValueError, TypeError, UnicodeError, OverflowError) as error:
+        raise StorageValidationError("The workspace contains a value that cannot be stored.") from error
 
 
 def empty_state() -> dict[str, Any]:
     return {"version": 2, **{key: [] for key in STATE_ARRAYS}, "pendingRequests": []}
 
 
-def ensure_meta(session: Session) -> None:
-    """Race-safe first-use bootstrap; this creates no sample business records."""
-    values = {"id": 1, "revision": 0, "version": 2, "extra": {"pendingRequests": []}}
-    dialect = session.get_bind().dialect.name
-    if dialect == "postgresql":
-        statement = pg_insert(WorkspaceMeta).values(**values).on_conflict_do_nothing(index_elements=["id"])
-    elif dialect == "sqlite":
-        statement = sqlite_insert(WorkspaceMeta).values(**values).on_conflict_do_nothing(index_elements=["id"])
-    else:
-        raise RuntimeError("Tracker persistence supports PostgreSQL; SQLite is reserved for unit tests.")
-    session.execute(statement)
+def _check_session(session):
+    if not session.in_transaction:
+        raise ValueError("The supplied MongoDB session must have an active transaction.")
 
 
-def _all(session: Session, model: type, *order: Any) -> list[Any]:
-    return list(session.scalars(select(model).order_by(*(order or (model.position,)))))
+def _documents(db, collection, session, cache):
+    if collection not in cache:
+        order = [("sequence", 1)] if collection == "audit_entry" else [("position", 1), ("_id", 1)]
+        cache[collection] = list(db[collection].find({}, session=session).sort(order))
+    return cache[collection]
 
 
-def _decimal(value: Any) -> Decimal | None:
-    return None if value is None else Decimal(str(value))
+def _decoded_chunks(documents, parent_field, identifier, count, digest):
+    chunks = sorted((row for row in documents if row[parent_field] == identifier), key=lambda row: row["position"])
+    if len(chunks) != count or [row["position"] for row in chunks] != list(range(count)):
+        raise StorageIntegrityError("Stored history chunks are missing or out of order.")
+    data = b"".join(bytes(row["data"]) for row in chunks)
+    if hashlib.sha256(data).hexdigest() != digest:
+        raise StorageIntegrityError("Stored history failed its integrity check.")
+    try:
+        return data.decode("utf-8")
+    except UnicodeError as error:
+        raise StorageIntegrityError("Stored history is not valid UTF-8.") from error
 
 
-def _date(value: Any) -> date | None:
-    return date.fromisoformat(value) if value else None
-
-
-def _timestamp(value: Any) -> datetime | None:
-    return datetime.fromisoformat(str(value).replace("Z", "+00:00")) if value else None
-
-
-def _iso(value: date | datetime | None) -> str | None:
-    if value is None:
-        return None
-    return value.isoformat().replace("+00:00", "Z")
-
-
-def _extra(record: dict[str, Any], known: set[str]) -> dict[str, Any]:
-    return _copy({key: value for key, value in record.items() if key not in known})
-
-
-def _asic_extra(record: dict[str, Any]) -> dict[str, Any]:
-    known = {"id", "name", "owner", "marketing", "price", "historicalPriceUnknown", "description",
-             "parts", "priceHistory", "archivedAt"}
-    if record.get("parts"):
-        # Structured variants are authoritative when present. Older backups may
-        # instead contain only flat lists/labels, whose pairings cannot be guessed.
-        known.update({"mpns", "cpns", "plid", "assembly", "subtype"})
-    return _extra(record, known)
-
-
-def _project_extra(record: dict[str, Any]) -> dict[str, Any]:
-    extra = _extra(record, {"id", "name", "key", "projectFamilyId", "manager", "scpm", "platform", "prototype",
-                            "parentId", "summary", "businessEntityId", "fundingSourceId", "entity", "funding",
-                            "asicIds", "leadTimes", "archivedAt"})
-    # Live association transit stays relational. Retain accepted legacy settings
-    # for unassociated ASICs until an explicit edit removes them.
-    unused_transit = {identifier: days for identifier, days in record.get("leadTimes", {}).items()
-                      if identifier not in record.get("asicIds", [])}
-    if unused_transit:
-        extra["leadTimes"] = unused_transit
-    return extra
-
-
-def _master_record(row: Any, identifier: str) -> dict[str, Any]:
-    record = _copy(row.extra or {})
-    record.update(id=getattr(row, identifier), name=row.name, description=row.description)
-    if row.archived_at is not None:
-        record["archivedAt"] = _iso(row.archived_at)
-    return record
-
-
-def get_workspace(session: Session, *, lock: bool = False) -> dict[str, Any]:
-    ensure_meta(session)
-    statement = select(WorkspaceMeta).where(WorkspaceMeta.id == 1)
-    if lock:
-        statement = statement.with_for_update()
-    meta = session.scalar(statement)
-    assert meta is not None
+def _read_workspace(db, session, cache=None):
+    cache = {} if cache is None else cache
+    meta = db[SCHEMA_COLLECTION].find_one({"_id": SCHEMA_DOCUMENT_ID}, session=session)
+    if not meta or meta.get("schema_version") != SCHEMA_VERSION:
+        raise SchemaNotReadyError("The MongoDB schema must be bootstrapped before use.")
     state = empty_state()
-    state.update(_copy(meta.extra or {}))
-    state["version"] = meta.version
-    entities = _all(session, BusinessEntity)
-    funding = _all(session, FundingSource)
-    families = _all(session, ProjectFamily)
-    asics = _all(session, ASIC)
-    projects = _all(session, Project)
-    parts = _all(session, ASICPart)
-    prices = _all(session, ASICPriceHistory)
-    associations = _all(session, ProjectASIC)
-    state["businessEntities"] = [_master_record(row, "business_entity_id") for row in entities]
-    state["fundingSources"] = [_master_record(row, "funding_source_id") for row in funding]
-    state["projectFamilies"] = []
-    for row in families:
-        record = _master_record(row, "project_family_id")
-        record.update(businessEntityId=row.business_entity_id, fundingSourceId=row.funding_source_id)
-        state["projectFamilies"].append(record)
-    entity_names = {row.business_entity_id: row.name for row in entities}
-    funding_names = {row.funding_source_id: row.name for row in funding}
-    families_by_id = {row.project_family_id: row for row in families}
-    state["projects"] = []
-    for row in projects:
-        family = families_by_id[row.project_family_id]
-        pairs = [pair for pair in associations if pair.project_id == row.project_id]
-        record = _copy(row.extra or {})
-        record.update(
-            id=row.project_id, name=row.project_name, key=row.project_key or "",
-            projectFamilyId=row.project_family_id, manager=row.engineering_project_manager,
-            scpm=row.supply_chain_program_manager, platform=row.platform,
-            parentId=row.parent_project_id or "", summary=row.description,
-            businessEntityId=family.business_entity_id, fundingSourceId=family.funding_source_id,
-            entity=entity_names[family.business_entity_id], funding=funding_names[family.funding_source_id],
-            asicIds=[pair.asic_id for pair in pairs],
-            leadTimes={**record.get("leadTimes", {}), **{pair.asic_id: pair.shipping_time_days for pair in pairs}},
-        )
-        if row.prototype is not None:
-            record["prototype"] = row.prototype
-        if row.archived_at is not None:
-            record["archivedAt"] = _iso(row.archived_at)
-        state["projects"].append(record)
-    state["asics"] = []
-    for row in asics:
-        variants = []
-        for part in parts:
-            if part.asic_id == row.asic_id:
-                value = _copy(part.extra or {})
-                value.update(id=part.part_id, mpn=part.mpn, cpn=part.customer_part_number,
-                             plid=part.plid, assembly=part.component_assembly_description,
-                             subtype=part.component_sub_type)
-                variants.append(value)
-        history = []
-        for price in prices:
-            if price.asic_id == row.asic_id:
-                value = _copy(price.extra or {})
-                value.update(quarter=price.effective_quarter, price=float(price.unit_price))
-                history.append(value)
-        unique = lambda key: list(dict.fromkeys(part[key] for part in variants if part.get(key)))
-        record = _copy(row.extra or {})
-        record.update(id=row.asic_id, name=row.asic_name,
-                      owner=row.si_ops_supply_chain_project_manager, marketing=row.marketing_name,
-                      description=row.description, price=None if row.unit_price is None else float(row.unit_price),
-                      parts=variants, priceHistory=history,
-                      mpns=unique("mpn") if variants else record.get("mpns", []),
-                      cpns=unique("cpn") if variants else record.get("cpns", []),
-                      plid=", ".join(unique("plid")) if variants else record.get("plid", ""),
-                      assembly=" | ".join(unique("assembly")) if variants else record.get("assembly", ""),
-                      subtype=" | ".join(unique("subtype")) if variants else record.get("subtype", ""))
-        if row.historical_price_unknown is not None:
-            record["historicalPriceUnknown"] = row.historical_price_unknown
-        if row.archived_at is not None:
-            record["archivedAt"] = _iso(row.archived_at)
-        state["asics"].append(record)
-    state["events"] = []
-    for row in _all(session, PlanningEvent):
-        record = _copy(row.extra or {})
-        record.update(id=row.event_id, type=row.event_type, asicId=row.asic_id,
-                      projectId=row.project_id or "", qty=row.quantity, date=_iso(row.event_date))
-        for field, value in (("shipDays", row.ship_days), ("requestedShipDate", _iso(row.requested_ship_date)),
-                             ("availableShipDate", _iso(row.available_ship_date)),
-                             ("createdAt", row.created_at_text), ("updatedAt", row.updated_at_text)):
-            if value is not None:
-                record[field] = value
-        # The current editor writes empty ETA/reference strings; retain that API shape.
-        record["eta"] = _iso(row.eta) or ""
-        record["requestId"] = row.request_reference or ""
-        state["events"].append(record)
-    lines = _all(session, ForecastLine, ForecastLine.forecast_version_id, ForecastLine.position)
-    state["forecastVersions"] = []
-    for row in _all(session, ForecastVersion):
-        record = _copy(row.extra or {})
-        record.update(id=row.forecast_version_id, month=row.version_month, name=row.name,
-                      createdAt=row.created_at_text, note=row.note, lines=[])
-        for line in lines:
-            if line.forecast_version_id == row.forecast_version_id:
-                value = _copy(line.extra or {})
-                value.update(asicId=line.asic_id, asicName=line.asic_name, projectId=line.project_id,
-                             projectName=line.project_name, category=line.category, phase=line.phase,
-                             type=line.event_type, month=line.period_month, qty=line.quantity)
-                if line.source_event_id is not None:
-                    value["sourceEventId"] = line.source_event_id
-                record["lines"].append(value)
-        state["forecastVersions"].append(record)
-    state["snapshots"] = [dict(id=row.snapshot_id, date=row.captured_at_text, label=row.label,
-                               data=_copy(row.data)) for row in _all(session, RecoverySnapshot)]
-    state["audit"] = []
-    for row in _all(session, AuditEntry, AuditEntry.sequence):
-        state["audit"].append(dict(id=row.audit_id, date=row.occurred_at_text, action=row.action,
-                                   detail=row.detail, actor=row.actor_subject,
-                                   actorName=row.actor_display_name, actorRole=row.actor_role,
-                                   legacy=row.is_legacy, revision=row.workspace_revision))
-    return {"revision": meta.revision, "state": state}
-
-
-def _key(row: Any, fields: tuple[str, ...]) -> tuple[Any, ...]:
-    return tuple(getattr(row, name) for name in fields)
-
-
-def _sync(session: Session, model: type, values: list[dict[str, Any]],
-          key_fields: tuple[str, ...]) -> list[Any]:
-    existing = {_key(row, key_fields): row for row in session.scalars(select(model))}
-    retained = set()
-    for value in values:
-        key = tuple(value[name] for name in key_fields)
-        retained.add(key)
-        row = existing.get(key)
-        if row is None:
-            row = model(**value)
-            session.add(row)
+    state.update(_copy(meta["extra"]))
+    state["version"] = meta["version"]
+    for array, collection in ENTITY_COLLECTIONS.items():
+        state[array] = [_copy(row["record"]) for row in _documents(db, collection, session, cache)]
+    for array in ("businessEntities", "fundingSources", "projectFamilies"):
+        for record in state[array]:
+            record.setdefault("description", "")
+    families = {row["id"]: row for row in state["projectFamilies"]}
+    entities = {row["id"]: row["name"] for row in state["businessEntities"]}
+    funding = {row["id"]: row["name"] for row in state["fundingSources"]}
+    for record in state["projects"]:
+        try:
+            family = families[record["projectFamilyId"]]
+            record.update(businessEntityId=family["businessEntityId"], fundingSourceId=family["fundingSourceId"],
+                          entity=entities[family["businessEntityId"]], funding=funding[family["fundingSourceId"]])
+        except KeyError as error:
+            raise StorageIntegrityError("A stored project has an incomplete family reference.") from error
+        for field in ("key", "scpm", "platform", "parentId", "summary"):
+            record.setdefault(field, "")
+        record.setdefault("leadTimes", {})
+        for identifier in record.get("asicIds", []):
+            record["leadTimes"].setdefault(identifier, record.get("leadDays") or 0)
+    for record in state["asics"]:
+        record.setdefault("parts", [])
+        record.setdefault("priceHistory", [])
+        record.setdefault("price", None)
+        for part in record["parts"]:
+            for field in ("cpn", "plid", "assembly", "subtype"):
+                part.setdefault(field, "")
+        for field in ("marketing", "description"):
+            record.setdefault(field, "")
+        if record["parts"]:
+            unique = lambda field: list(dict.fromkeys(part[field] for part in record["parts"] if part.get(field)))
+            record.update(mpns=unique("mpn"), cpns=unique("cpn"), plid=", ".join(unique("plid")),
+                          assembly=" | ".join(unique("assembly")), subtype=" | ".join(unique("subtype")))
         else:
-            for name, item in value.items():
-                setattr(row, name, item)
-    session.flush()
-    return [row for key, row in existing.items() if key not in retained]
+            for field in ("mpns", "cpns"):
+                record.setdefault(field, [])
+            for field in ("plid", "assembly", "subtype"):
+                record.setdefault(field, "")
+    for record in state["events"]:
+        for field in ("projectId", "eta", "requestId"):
+            record.setdefault(field, "")
+    lines = _documents(db, "forecast_line", session, cache)
+    state["forecastVersions"] = []
+    for row in _documents(db, "forecast_version", session, cache):
+        record = _copy(row["record"])
+        record.setdefault("note", "")
+        record["lines"] = [_copy(line["record"]) for line in lines if line["forecast_version_id"] == row["_id"]]
+        state["forecastVersions"].append(record)
+    chunks = _documents(db, "snapshot_chunk", session, cache)
+    state["snapshots"] = []
+    for row in _documents(db, "recovery_snapshot", session, cache):
+        raw = _decoded_chunks(chunks, "snapshot_id", row["_id"], row["chunk_count"], row["sha256"])
+        try:
+            data = json.loads(raw)
+        except ValueError as error:
+            raise StorageIntegrityError("Stored recovery history is not valid JSON.") from error
+        state["snapshots"].append(dict(id=row["_id"], date=row["date"], label=row["label"], data=data))
+    chunks = _documents(db, "audit_chunk", session, cache)
+    state["audit"] = []
+    for row in _documents(db, "audit_entry", session, cache):
+        record = _copy(row["record"])
+        if row["detail_chunk_count"]:
+            record["detail"] = _decoded_chunks(chunks, "audit_id", row["_id"], row["detail_chunk_count"], row["detail_sha256"])
+        elif hashlib.sha256(record["detail"].encode("utf-8")).hexdigest() != row["detail_sha256"]:
+            raise StorageIntegrityError("Stored audit history failed its integrity check.")
+        state["audit"].append(record)
+    return {"revision": meta["revision"], "state": state}
 
 
-def _preclear_uniques(session: Session, state: dict[str, Any]) -> None:
-    """Allow atomic name/key swaps and import replacements without transient collisions."""
-    for model, array, key_attr, name_attr, source_name in (
-        (BusinessEntity, "businessEntities", "business_entity_id", "name", "name"),
-        (FundingSource, "fundingSources", "funding_source_id", "name", "name"),
-        (ProjectFamily, "projectFamilies", "project_family_id", "name", "name"),
-        (Project, "projects", "project_id", "project_name", "name"),
-        (ASIC, "asics", "asic_id", "asic_name", "name"),
-    ):
-        desired = {value["id"]: value for value in state[array]}
-        for row in session.scalars(select(model)):
-            value = desired.get(getattr(row, key_attr))
-            if value is None or value[source_name] != getattr(row, name_attr):
-                setattr(row, name_attr, "transition-" + uuid.uuid4().hex)
-            if model is Project and (value is None or (value.get("key") or None) != row.project_key):
-                row.project_key = None
-    desired_parts = {part["id"]: (asic["id"], part) for asic in state["asics"] for part in asic.get("parts", [])}
-    for row in session.scalars(select(ASICPart)):
-        desired = desired_parts.get(row.part_id)
-        if desired is None or desired[0] != row.asic_id or desired[1]["mpn"] != row.mpn:
-            row.mpn = "transition-" + uuid.uuid4().hex
-    desired_versions = {value["id"]: value for value in state.get("forecastVersions", [])}
-    rows = list(session.scalars(select(ForecastVersion)))
-    used = {row.version_month for row in rows} | {value["month"] for value in desired_versions.values()}
-    candidates = (f"{year:04d}-{month:02d}" for year in range(1, 10000) for month in range(1, 13))
-    for row in rows:
-        desired = desired_versions.get(row.forecast_version_id)
-        if desired is None or desired["month"] != row.version_month:
-            temporary = next(value for value in candidates if value not in used)
-            used.add(temporary)
-            row.version_month = temporary
-    session.flush()
+def get_workspace(db, *, session=None, lock=False):
+    """Read one coherent revision. lock is retained for old callers' compatibility."""
+    if session is None:
+        return run_transaction(db, lambda active: _read_workspace(db, active))
+    _check_session(session)
+    return _read_workspace(db, session)
 
 
-def _audit_value(collection: str, value: dict[str, Any] | None) -> dict[str, Any] | None:
+def _check_document(collection, document):
+    try:
+        size = len(BSON.encode(document))
+    except (InvalidDocument, OverflowError, UnicodeError) as error:
+        raise StorageValidationError("A workspace record contains a value that cannot be stored.") from error
+    if size > MAX_DOCUMENT_BYTES:
+        raise StorageValidationError("A single workspace record exceeds MongoDB's 16 MiB document limit.")
+
+
+def _chunks(identifier, parent_field, data):
+    return [{"_id": f"{identifier}:{index}", parent_field: identifier, "position": index,
+             "data": data[start:start + CHUNK_BYTES]}
+            for index, start in enumerate(range(0, len(data), CHUNK_BYTES))]
+
+
+def _ordinary_documents(state):
+    result = {collection: [] for collection in ORDINARY_COLLECTIONS}
+    for array, collection in ENTITY_COLLECTIONS.items():
+        for index, value in enumerate(state[array]):
+            record = _copy(value)
+            if array == "projects":
+                for field in ("businessEntityId", "fundingSourceId", "entity", "funding"):
+                    record.pop(field, None)
+            result[collection].append(dict(_id=value["id"], position=index, record=record))
+    for index, value in enumerate(state["forecastVersions"]):
+        record = _copy({key: item for key, item in value.items() if key != "lines"})
+        result["forecast_version"].append(dict(_id=value["id"], position=index, record=record))
+        for position, line in enumerate(value.get("lines", [])):
+            result["forecast_line"].append(dict(_id=f"{value['id']}:{position}", forecast_version_id=value["id"],
+                                                position=position, record=_copy(line)))
+    for index, value in enumerate(state["snapshots"]):
+        data = json.dumps(value["data"], ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+        chunks = _chunks(value["id"], "snapshot_id", data)
+        result["snapshot_chunk"].extend(chunks)
+        result["recovery_snapshot"].append(dict(_id=value["id"], position=index, date=value["date"], label=value["label"],
+                                                 chunk_count=len(chunks), sha256=hashlib.sha256(data).hexdigest()))
+    return result
+
+
+def _audit_value(collection, value):
     if value is None or collection not in {"snapshots", "forecastVersions"}:
         return value
     data = json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False)
-    return {"id": value["id"], "name": value.get("name", value.get("label")),
-            "month": value.get("month"), "lineCount": len(value.get("lines", [])),
-            "sha256": hashlib.sha256(data.encode()).hexdigest()}
+    return {"id": value["id"], "name": value.get("name", value.get("label")), "month": value.get("month"),
+            "lineCount": len(value.get("lines", [])), "sha256": hashlib.sha256(data.encode()).hexdigest()}
 
 
-def _changes(before: dict[str, Any], after: dict[str, Any]) -> list[dict[str, Any]]:
+def _changes(before, after):
     result = []
     for collection in STATE_ARRAYS:
         if collection == "audit":
@@ -315,132 +230,89 @@ def _changes(before: dict[str, Any], after: dict[str, Any]) -> list[dict[str, An
     return result
 
 
-def write_workspace(session: Session, state: dict[str, Any], *, expected_revision: int,
-                    actor: dict[str, Any], reason: str, operation: str = "edit") -> dict[str, Any]:
-    current = get_workspace(session, lock=True)
+def _audit_document(record, sequence):
+    record = _copy(record)
+    detail = record["detail"].encode("utf-8")
+    chunks = _chunks(record["id"], "audit_id", detail) if len(detail) > CHUNK_BYTES else []
+    if chunks:
+        record.pop("detail")
+    return dict(_id=record["id"], sequence=sequence, workspace_revision=record["revision"], record=record,
+                detail_chunk_count=len(chunks), detail_sha256=hashlib.sha256(detail).hexdigest()), chunks
+
+
+def _synchronize(db, collection, desired, session, cache):
+    existing = {row["_id"]: row for row in _documents(db, collection, session, cache)}
+    wanted = {row["_id"]: row for row in desired}
+    writes = [ReplaceOne({"_id": key}, value, upsert=True) for key, value in wanted.items() if existing.get(key) != value]
+    if writes:
+        db[collection].bulk_write(writes, ordered=True, session=session)
+    removed = list(existing.keys() - wanted.keys())
+    for start in range(0, len(removed), 500):
+        db[collection].delete_many({"_id": {"$in": removed[start:start + 500]}}, session=session)
+
+
+def _write_workspace(db, state, *, expected_revision, actor, reason, operation, session):
+    cache = {}
+    current = _read_workspace(db, session, cache)
     if current["revision"] != expected_revision:
         raise RevisionConflict(current["revision"])
     state = _copy(state)
     for collection in STATE_ARRAYS:
         state.setdefault(collection, [])
-    _preclear_uniques(session, state)
-    stale: dict[type, list[Any]] = {}
-    master_known = {"id", "name", "description", "archivedAt"}
-    for array, model, identifier in (("businessEntities", BusinessEntity, "business_entity_id"),
-                                    ("fundingSources", FundingSource, "funding_source_id")):
-        stale[model] = _sync(session, model, [dict(
-            **{identifier: value["id"]}, name=value["name"], description=value.get("description", ""),
-            archived_at=_timestamp(value.get("archivedAt")), position=index,
-            extra=_extra(value, master_known)) for index, value in enumerate(state[array])], (identifier,))
-    stale[ASIC] = _sync(session, ASIC, [dict(
-        asic_id=value["id"], asic_name=value["name"], si_ops_supply_chain_project_manager=value["owner"],
-        marketing_name=value.get("marketing", ""), unit_price=_decimal(value.get("price")),
-        historical_price_unknown=value.get("historicalPriceUnknown"), description=value.get("description", ""),
-        archived_at=_timestamp(value.get("archivedAt")), position=index,
-        extra=_asic_extra(value))
-        for index, value in enumerate(state["asics"])], ("asic_id",))
-    stale[ProjectFamily] = _sync(session, ProjectFamily, [dict(
-        project_family_id=value["id"], name=value["name"], business_entity_id=value["businessEntityId"],
-        funding_source_id=value["fundingSourceId"], description=value.get("description", ""), position=index,
-        archived_at=_timestamp(value.get("archivedAt")),
-        extra=_extra(value, master_known | {"businessEntityId", "fundingSourceId"}))
-        for index, value in enumerate(state["projectFamilies"])], ("project_family_id",))
-    stale[Project] = _sync(session, Project, [dict(
-        project_id=value["id"], project_name=value["name"], project_key=value.get("key") or None,
-        project_family_id=value["projectFamilyId"], engineering_project_manager=value["manager"],
-        supply_chain_program_manager=value.get("scpm", ""), platform=value.get("platform", ""),
-        prototype=value.get("prototype"), parent_project_id=value.get("parentId") or None,
-        description=value.get("summary", ""), archived_at=_timestamp(value.get("archivedAt")), position=index,
-        extra=_project_extra(value))
-        for index, value in enumerate(state["projects"])], ("project_id",))
-    part_values, price_values, pair_values = [], [], []
-    for asic in state["asics"]:
-        for index, part in enumerate(asic.get("parts", [])):
-            part_values.append(dict(part_id=part["id"], asic_id=asic["id"], mpn=part["mpn"],
-                                    customer_part_number=part.get("cpn", ""), plid=part.get("plid", ""),
-                                    component_assembly_description=part.get("assembly", ""),
-                                    component_sub_type=part.get("subtype", ""), position=index,
-                                    extra=_extra(part, {"id", "mpn", "cpn", "plid", "assembly", "subtype"})))
-        for index, price in enumerate(asic.get("priceHistory", [])):
-            price_values.append(dict(asic_id=asic["id"], effective_quarter=price["quarter"],
-                                     unit_price=_decimal(price["price"]), position=index,
-                                     extra=_extra(price, {"quarter", "price"})))
-    for project in state["projects"]:
-        for index, asic_id in enumerate(project.get("asicIds", [])):
-            pair_values.append(dict(project_id=project["id"], asic_id=asic_id, position=index,
-                                    shipping_time_days=project.get("leadTimes", {}).get(asic_id, project.get("leadDays") or 0)))
-    stale[ASICPart] = _sync(session, ASICPart, part_values, ("part_id",))
-    stale[ASICPriceHistory] = _sync(session, ASICPriceHistory, price_values, ("asic_id", "effective_quarter"))
-    stale[ProjectASIC] = _sync(session, ProjectASIC, pair_values, ("project_id", "asic_id"))
-    requests = [value for value in state["events"] if value["type"] == "request"]
-    event_values = []
-    for index, value in enumerate(state["events"]):
-        reference = value.get("requestId") or None
-        matching = [request for request in requests if request["asicId"] == value["asicId"]
-                    and request["projectId"] == value.get("projectId")
-                    and reference in (request["id"], request.get("requestId"))] if reference else []
-        exact = next((request for request in matching if request["id"] == reference), None)
-        canonical = exact or (matching[0] if len(matching) == 1 else None)
-        event_values.append(dict(event_id=value["id"], event_type=value["type"], asic_id=value["asicId"],
-                                 project_id=value.get("projectId") or None, quantity=value["qty"],
-                                 event_date=_date(value["date"]), ship_days=value.get("shipDays"),
-                                 requested_ship_date=_date(value.get("requestedShipDate")),
-                                 available_ship_date=_date(value.get("availableShipDate")), eta=_date(value.get("eta")),
-                                 request_reference=reference,
-                                 canonical_request_id=canonical["id"] if canonical and value["type"] != "request" else None,
-                                 created_at_text=value.get("createdAt"), updated_at_text=value.get("updatedAt"), position=index,
-                                 extra=_extra(value, {"id", "type", "asicId", "projectId", "qty", "date", "shipDays",
-                                                     "requestedShipDate", "availableShipDate", "eta", "requestId", "createdAt", "updatedAt"})))
-    stale[PlanningEvent] = _sync(session, PlanningEvent, event_values, ("event_id",))
-    version_values, line_values = [], []
-    for index, version in enumerate(state.get("forecastVersions", [])):
-        version_values.append(dict(forecast_version_id=version["id"], version_month=version["month"],
-                                   name=version["name"], created_at_text=version["createdAt"], note=version.get("note", ""),
-                                   position=index, extra=_extra(version, {"id", "month", "name", "createdAt", "note", "lines"})))
-        for position, line in enumerate(version.get("lines", [])):
-            line_values.append(dict(forecast_version_id=version["id"], position=position, asic_id=line["asicId"],
-                                    asic_name=line["asicName"], project_id=line.get("projectId", ""), project_name=line["projectName"],
-                                    category=line["category"], phase=line["phase"], event_type=line["type"], period_month=line["month"],
-                                    quantity=line["qty"], source_event_id=line.get("sourceEventId"),
-                                    extra=_extra(line, {"asicId", "asicName", "projectId", "projectName", "category", "phase",
-                                                       "type", "month", "qty", "sourceEventId"})))
-    stale[ForecastVersion] = _sync(session, ForecastVersion, version_values, ("forecast_version_id",))
-    stale[ForecastLine] = _sync(session, ForecastLine, line_values, ("forecast_version_id", "position"))
-    stale[RecoverySnapshot] = _sync(session, RecoverySnapshot, [dict(
-        snapshot_id=value["id"], captured_at_text=value["date"], label=value["label"], data=_copy(value["data"]), position=index)
-        for index, value in enumerate(state.get("snapshots", []))], ("snapshot_id",))
-    # Remove children before parents. The two self-referential FKs are deferred.
-    for model in (PlanningEvent, ProjectASIC, ASICPriceHistory, ASICPart, ForecastLine, ForecastVersion,
-                  RecoverySnapshot, Project, ProjectFamily, ASIC, BusinessEntity, FundingSource):
-        for row in stale.get(model, []):
-            session.delete(row)
-        session.flush()
-    meta = session.get(WorkspaceMeta, 1)
-    assert meta is not None
-    meta.version = 2
-    meta.extra = _extra(state, set(STATE_ARRAYS) | {"version", "storageNotice"})
-    meta.extra.setdefault("pendingRequests", [])
-    meta.revision += 1
-    sequence = int(session.scalar(select(func.max(AuditEntry.sequence))) or 0)
+    ordinary = _ordinary_documents(state)
+    meta = db[SCHEMA_COLLECTION].find_one({"_id": SCHEMA_DOCUMENT_ID}, session=session)
+    sequence = meta["audit_sequence"]
+    audit, chunks = [], []
     if operation == "import":
-        existing_audit_ids = set(session.scalars(select(AuditEntry.audit_id)))
-        for entry in state.get("audit", []):
-            if entry["id"] not in existing_audit_ids:
+        known = {row["_id"] for row in cache["audit_entry"]}
+        for entry in state["audit"]:
+            if entry["id"] not in known:
                 sequence += 1
-                session.add(AuditEntry(audit_id=entry["id"], sequence=sequence, workspace_revision=None,
-                                       occurred_at_text=entry["date"], action=entry["action"], detail=entry["detail"],
-                                       actor_subject=None, actor_display_name=None, actor_role=None, is_legacy=True))
-                existing_audit_ids.add(entry["id"])
+                record = dict(id=entry["id"], date=entry["date"], action=entry["action"], detail=entry["detail"],
+                              actor=None, actorName=None, actorRole=None, legacy=True, revision=None)
+                document, pieces = _audit_document(record, sequence)
+                audit.append(document)
+                chunks.extend(pieces)
+                known.add(entry["id"])
     changes = _changes(current["state"], state)
-    detail: dict[str, Any] = {"revision": meta.revision, "operation": operation,
-                             "changeCount": len(changes), "changes": changes}
+    revision = expected_revision + 1
+    detail = dict(revision=revision, operation=operation, changeCount=len(changes), changes=changes)
     if len(changes) == 1:
         detail.update(before=changes[0]["before"], after=changes[0]["after"])
-    session.add(AuditEntry(audit_id="server-" + str(uuid.uuid4()), sequence=sequence + 1,
-                           workspace_revision=meta.revision, occurred_at_text=_iso(datetime.now(timezone.utc)),
-                           action=((reason or "").strip() or "Update workspace")[:200],
-                           detail=json.dumps(detail, ensure_ascii=False, allow_nan=False, separators=(",", ":")),
-                           actor_subject=actor["subject"], actor_display_name=actor.get("display_name"),
-                           actor_role=actor.get("role"), is_legacy=False))
-    session.flush()
-    return get_workspace(session)
+    record = dict(id="server-" + str(uuid.uuid4()), date=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                  action=((reason or "").strip() or "Update workspace")[:200],
+                  detail=json.dumps(detail, ensure_ascii=False, allow_nan=False, separators=(",", ":")),
+                  actor=actor["subject"], actorName=actor.get("display_name"), actorRole=actor.get("role"),
+                  legacy=False, revision=revision)
+    document, pieces = _audit_document(record, sequence + 1)
+    audit.append(document)
+    chunks.extend(pieces)
+    extra = {key: value for key, value in state.items() if key not in set(STATE_ARRAYS) | {"version", "storageNotice"}}
+    extra.setdefault("pendingRequests", [])
+    next_meta = dict(_id=SCHEMA_DOCUMENT_ID, schema_version=SCHEMA_VERSION, revision=revision,
+                     version=2, audit_sequence=sequence + 1, extra=extra)
+    # Complete BSON serialization/size checks before the first write. The entire
+    # operation also rolls back for any later server-side validation failure.
+    for collection, documents in {**ordinary, "audit_entry": audit, "audit_chunk": chunks, SCHEMA_COLLECTION: [next_meta]}.items():
+        for value in documents:
+            _check_document(collection, value)
+    updated = db[SCHEMA_COLLECTION].update_one({"_id": SCHEMA_DOCUMENT_ID, "revision": expected_revision},
+        {"$set": {key: value for key, value in next_meta.items() if key != "_id"}}, session=session)
+    if updated.matched_count != 1:
+        latest = db[SCHEMA_COLLECTION].find_one({"_id": SCHEMA_DOCUMENT_ID}, session=session)
+        raise RevisionConflict(latest["revision"])
+    for collection, desired in ordinary.items():
+        _synchronize(db, collection, desired, session, cache)
+    if chunks:
+        db.audit_chunk.insert_many(chunks, ordered=True, session=session)
+    db.audit_entry.insert_many(audit, ordered=True, session=session)
+    return _read_workspace(db, session)
+
+
+def write_workspace(db, state, *, expected_revision, actor, reason, operation="edit", session=None):
+    callback = lambda active: _write_workspace(db, state, expected_revision=expected_revision, actor=actor,
+                                              reason=reason, operation=operation, session=active)
+    if session is None:
+        return run_transaction(db, callback)
+    _check_session(session)
+    return callback(session)

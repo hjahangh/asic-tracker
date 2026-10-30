@@ -1,57 +1,105 @@
-# Local development only: explicit development identity and a loopback web port.
+# Local development: authenticated single-node MongoDB replica set, loopback web port.
 x-application: &application
   image: asic-tracker:local
   build: .
-  environment: &development-environment
-    DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-asic_tracker_dev}:${POSTGRES_PASSWORD:?Run python3 scripts/bootstrap_dev.py first}@db:5432/${POSTGRES_DB:-asic_tracker_dev}
-    AUTH_MODE: development
-    DEV_USER: local-developer
-    DEV_ROLE: admin
-    TRUSTED_HOSTS: localhost,127.0.0.1
   read_only: true
-  tmpfs:
-    - /tmp
+  tmpfs: [/tmp]
   cap_drop: [ALL]
-  security_opt:
-    - no-new-privileges:true
+  security_opt: [no-new-privileges:true]
   init: true
 
 services:
-  db:
-    image: postgres:17
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-asic_tracker_dev}
-      POSTGRES_DB: ${POSTGRES_DB:-asic_tracker_dev}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run python3 scripts/bootstrap_dev.py first}
+  keyfile-init:
+    image: mongo:8.0
+    user: "0:0"
+    entrypoint: [bash, -eu, -c]
+    command:
+      - rm -f /keyfile/keyfile && cp /run/secrets/mongodb-keyfile /keyfile/keyfile && chmod 400 /keyfile/keyfile && chown 999:999 /keyfile/keyfile
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - ${MONGODB_KEYFILE:?Run python3 scripts/bootstrap_dev.py first}:/run/secrets/mongodb-keyfile:ro
+      - mongodb_keyfile:/keyfile
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE]
+    security_opt: [no-new-privileges:true]
+    restart: "no"
+
+  db:
+    image: mongo:8.0
+    ulimits:
+      nofile:
+        soft: 64000
+        hard: 64000
+    command: [mongod, --replSet, tracker-rs, --bind_ip_all, --keyFile, /run/mongodb-keyfile/keyfile, --auth]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:?Run python3 scripts/bootstrap_dev.py first}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?Run python3 scripts/bootstrap_dev.py first}
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_keyfile:/run/mongodb-keyfile:ro
+    depends_on:
+      keyfile-init:
+        condition: service_completed_successfully
     healthcheck:
-      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      test: [CMD, mongosh, --quiet, --eval, "quit(db.adminCommand({ping:1}).ok === 1 ? 0 : 1)"]
       interval: 5s
       timeout: 5s
-      retries: 15
+      retries: 30
     restart: unless-stopped
 
-  migrate:
-    <<: *application
-    command: [alembic, upgrade, head]
-    healthcheck:
-      disable: true
+  setup-db:
+    image: mongo:8.0
+    entrypoint: [mongosh, --nodb, --quiet, --file, /opt/tracker/setup_mongodb.js]
+    environment:
+      MONGODB_ADMIN_URI: mongodb://${MONGO_ROOT_USER}:${MONGO_ROOT_PASSWORD}@db:27017/admin?authSource=admin&directConnection=true
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-asic_tracker_dev}
+      MONGODB_OWNER_USER: ${MONGODB_OWNER_USER:?Run python3 scripts/bootstrap_dev.py first}
+      MONGODB_OWNER_PASSWORD: ${MONGODB_OWNER_PASSWORD:?Run python3 scripts/bootstrap_dev.py first}
+      MONGODB_RUNTIME_USER: ${MONGODB_RUNTIME_USER:?Run python3 scripts/bootstrap_dev.py first}
+      MONGODB_RUNTIME_PASSWORD: ${MONGODB_RUNTIME_PASSWORD:?Run python3 scripts/bootstrap_dev.py first}
+      MONGODB_INIT_REPLICA_SET: "true"
+      MONGODB_REPLICA_SET: tracker-rs
+      MONGODB_REPLICA_MEMBER: db:27017
+    volumes:
+      - ./scripts/setup_mongodb.js:/opt/tracker/setup_mongodb.js:ro
+    read_only: true
+    tmpfs: [/tmp, /data/db]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     depends_on:
       db:
         condition: service_healthy
     restart: "no"
 
+  migrate:
+    <<: *application
+    command: [python, -m, app.migrate]
+    environment:
+      MONGODB_URI: mongodb://${MONGODB_OWNER_USER}:${MONGODB_OWNER_PASSWORD}@db:27017/${MONGODB_DATABASE:-asic_tracker_dev}?authSource=${MONGODB_DATABASE:-asic_tracker_dev}&replicaSet=tracker-rs
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-asic_tracker_dev}
+    healthcheck:
+      disable: true
+    depends_on:
+      setup-db:
+        condition: service_completed_successfully
+    restart: "no"
+
   app:
     <<: *application
+    environment:
+      MONGODB_URI: mongodb://${MONGODB_RUNTIME_USER}:${MONGODB_RUNTIME_PASSWORD}@db:27017/${MONGODB_DATABASE:-asic_tracker_dev}?authSource=${MONGODB_DATABASE:-asic_tracker_dev}&replicaSet=tracker-rs
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-asic_tracker_dev}
+      AUTH_MODE: development
+      DEV_USER: local-developer
+      DEV_ROLE: admin
+      TRUSTED_HOSTS: localhost,127.0.0.1
     ports:
       - "127.0.0.1:${HTTP_PORT:-8080}:8000"
     depends_on:
-      db:
-        condition: service_healthy
       migrate:
         condition: service_completed_successfully
     restart: unless-stopped
 
 volumes:
-  postgres_data:
+  mongodb_data:
+  mongodb_keyfile:

@@ -12,20 +12,23 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from sqlalchemy import create_engine, event as sqlalchemy_event, text
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
+from bson.errors import BSONError
+from pymongo import timeout as mongodb_timeout
+from pymongo.database import Database
+from pymongo.errors import BulkWriteError, DuplicateKeyError, OperationFailure, PyMongoError
+from pymongo.read_concern import ReadConcern
+from pymongo.read_preferences import ReadPreference
+from pymongo.write_concern import WriteConcern
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .auth import Actor, actor_for_request, require_editor
 from .config import Settings
+from .database import check_ready, create_client
 from .domain import INVALID_TEXT, DomainError, requires_admin, validate_transition, validate_workspace
 from .planning import allocation_plan, today_pacific, valid_date
 from . import repository
 
 log = logging.getLogger("asic_tracker")
-EXPECTED_SCHEMA_REVISION = "20261029_0001"
 
 
 class WorkspaceWrite(BaseModel):
@@ -89,30 +92,26 @@ class BodyLimitMiddleware:
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
-    engine = None
-    if settings.database_url:
-        options = {"pool_pre_ping": True}
-        if settings.database_url.startswith("sqlite"):
-            options.update(connect_args={"check_same_thread": False}, poolclass=StaticPool)
-        engine = create_engine(settings.database_url, **options)
-        if settings.database_url.startswith("sqlite"):
-            @sqlalchemy_event.listens_for(engine, "connect")
-            def sqlite_foreign_keys(dbapi_connection, connection_record):
-                dbapi_connection.execute("PRAGMA foreign_keys=ON")
-    factory = sessionmaker(bind=engine, expire_on_commit=False) if engine else None
+    client, database = None, None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        nonlocal client, database
         settings.validate()
+        client = create_client(settings.mongodb_uri)
+        database = client[settings.mongodb_database]
+        app.state.mongo_client, app.state.database = client, database
         if settings.auth_mode == "development":
             log.warning("Development identity is enabled. Use only on a loopback-bound development deployment.")
-        yield
-        if engine is not None:
-            engine.dispose()
+        try:
+            yield
+        finally:
+            client.close()
+            app.state.mongo_client, app.state.database = None, None
 
     app = FastAPI(title="ASIC Tracker API", version="0.1.0", docs_url=None, redoc_url=None,
         openapi_url=None, lifespan=lifespan)
-    app.state.settings, app.state.engine, app.state.session_factory = settings, engine, factory
+    app.state.settings, app.state.mongo_client, app.state.database = settings, None, None
     app.add_middleware(BodyLimitMiddleware, max_bytes=settings.max_body_bytes)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(settings.trusted_hosts))
 
@@ -154,21 +153,39 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def revision_error(request: Request, error):
         return JSONResponse({"detail": {"code": "revision_conflict", "message": "Another user updated the workspace. Load the latest data and retry your change.", "current_revision": error.current_revision}}, status_code=409)
 
-    @app.exception_handler(IntegrityError)
-    async def integrity_error(request: Request, error):
-        log.warning("Workspace change rejected by a database integrity constraint.")
-        return JSONResponse({"detail": {"code": "integrity_conflict", "message": "A database relationship or uniqueness rule rejected the change. No partial update was saved."}}, status_code=422)
+    @app.exception_handler(repository.StorageValidationError)
+    async def storage_validation_error(request: Request, error):
+        return JSONResponse({"detail": {"code": "invalid_workspace", "message": str(error)}}, status_code=422)
 
-    @app.exception_handler(SQLAlchemyError)
+    @app.exception_handler(repository.StorageIntegrityError)
+    @app.exception_handler(repository.SchemaNotReadyError)
+    async def storage_unavailable(request: Request, error):
+        log.warning("Workspace storage check failed (%s).", type(error).__name__)
+        return JSONResponse({"detail": {"code": "database_unavailable", "message": "The database schema or stored workspace needs attention from the hosting team."}}, status_code=503)
+
+    @app.exception_handler(DuplicateKeyError)
+    async def integrity_error(request: Request, error):
+        log.warning("Workspace change rejected by a MongoDB uniqueness constraint.")
+        return JSONResponse({"detail": {"code": "integrity_conflict", "message": "A database uniqueness rule rejected the change. No partial update was saved."}}, status_code=422)
+
+    @app.exception_handler(PyMongoError)
     async def database_error(request: Request, error):
         log.warning("Database operation failed (%s).", type(error).__name__)
+        if request.method == "PUT" and isinstance(error, BulkWriteError):
+            details = error.details or {}
+            codes = [item.get("code") for item in details.get("writeErrors", [])]
+            if codes and not details.get("writeConcernErrors") and all(code in {11000, 121, 10334, 17419} for code in codes):
+                if all(code == 11000 for code in codes):
+                    return JSONResponse({"detail": {"code": "integrity_conflict", "message": "A database uniqueness rule rejected the change. No partial update was saved."}}, status_code=422)
+                return JSONResponse({"detail": {"code": "invalid_workspace", "message": "A document does not meet the database validation or size limits. No partial update was saved."}}, status_code=422)
+        if request.method == "PUT" and isinstance(error, OperationFailure) and error.code in {121, 10334, 17419}:
+            return JSONResponse({"detail": {"code": "invalid_workspace", "message": "A document does not meet the database validation or size limits. No partial update was saved."}}, status_code=422)
         return JSONResponse({"detail": {"code": "database_unavailable", "message": "The database is unavailable. Retry after the hosting team checks the service."}}, status_code=503)
 
-    def session_dependency():
-        if factory is None:
+    def database_dependency():
+        if database is None:
             raise HTTPException(503, detail={"code": "database_unconfigured", "message": "Database configuration is missing."})
-        with factory() as session:
-            yield session
+        return database
 
     @app.get("/health/live")
     @app.get("/api/health/live", include_in_schema=False)
@@ -178,18 +195,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/health/ready")
     @app.get("/api/health/ready", include_in_schema=False)
     def ready():
-        if factory is None:
+        if database is None:
             return JSONResponse({"status": "not_ready"}, status_code=503)
         try:
-            with factory() as session:
-                session.execute(text("SELECT 1"))
-                session.execute(text("SELECT id FROM workspace_meta LIMIT 1"))
-                if settings.require_migrations:
-                    revisions = set(session.scalars(text("SELECT version_num FROM alembic_version")))
-                    if revisions != {EXPECTED_SCHEMA_REVISION}:
-                        return JSONResponse({"status": "not_ready", "reason": "migrations_required"}, status_code=503)
-            return {"status": "ready"}
-        except SQLAlchemyError:
+            result = check_ready(database)
+            return JSONResponse(result, status_code=200 if result.get("status") == "ready" else 503)
+        except PyMongoError:
             return JSONResponse({"status": "not_ready", "reason": "database_or_schema_unavailable"}, status_code=503)
 
     @app.get("/api/me")
@@ -197,35 +208,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return actor.as_dict()
 
     @app.get("/api/workspace")
-    def workspace(actor: Actor = Depends(actor_for_request), session: Session = Depends(session_dependency)):
-        with session.begin():
-            # The relational envelope needs a single coherent revision across
-            # its multiple SELECTs under PostgreSQL's READ COMMITTED isolation.
-            result = repository.get_workspace(session, lock=True)
+    def workspace(actor: Actor = Depends(actor_for_request), db: Database = Depends(database_dependency)):
+        result = repository.get_workspace(db)
         return JSONResponse(result, headers={"ETag": f'"{result["revision"]}"'})
 
     @app.put("/api/workspace")
-    def put_workspace(body: WorkspaceWrite, actor: Actor = Depends(actor_for_request), session: Session = Depends(session_dependency)):
+    def put_workspace(body: WorkspaceWrite, actor: Actor = Depends(actor_for_request), db: Database = Depends(database_dependency)):
         require_editor(actor)
-        with session.begin():
-            current = repository.get_workspace(session, lock=True)
+
+        def save_transaction(session):
+            current = repository.get_workspace(db, session=session)
             if current["revision"] != body.revision:
                 raise repository.RevisionConflict(current["revision"])
             normalized = validate_workspace(body.state)
             if requires_admin(current["state"], normalized, body.operation) and actor.role != "admin":
                 raise HTTPException(403, detail={"code": "admin_required", "message": "An administrator is required for family ownership changes, deletion, import, reset or restore."})
             normalized = validate_transition(current["state"], normalized, operation=body.operation)
-            result = repository.write_workspace(session, normalized, expected_revision=body.revision,
-                actor=actor.as_dict(), reason=body.reason, operation=body.operation)
+            return repository.write_workspace(db, normalized, expected_revision=body.revision,
+                actor=actor.as_dict(), reason=body.reason, operation=body.operation, session=session)
+
+        try:
+            with mongodb_timeout(15), db.client.start_session() as session:
+                result = session.with_transaction(save_transaction, read_concern=ReadConcern("snapshot"),
+                    write_concern=WriteConcern("majority"), read_preference=ReadPreference.PRIMARY,
+                    max_commit_time_ms=15000)
+        except (BSONError, OverflowError) as error:
+            raise DomainError("The workspace contains a value outside MongoDB's supported BSON limits.") from error
         return JSONResponse(result, headers={"ETag": f'"{result["revision"]}"'})
 
     @app.get("/api/availability")
-    def availability(as_of: str | None = None, actor: Actor = Depends(actor_for_request), session: Session = Depends(session_dependency)):
+    def availability(as_of: str | None = None, actor: Actor = Depends(actor_for_request), db: Database = Depends(database_dependency)):
         as_of = as_of or today_pacific()
         if not valid_date(as_of):
             raise HTTPException(422, detail={"code": "invalid_date", "message": "as_of must be a valid YYYY-MM-DD date."})
-        with session.begin():
-            current = repository.get_workspace(session, lock=True)
+        current = repository.get_workspace(db)
         return {"revision": current["revision"], "asOf": as_of, **allocation_plan(current["state"], as_of)}
 
     if settings.enable_api_docs:

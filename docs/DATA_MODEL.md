@@ -1,148 +1,105 @@
 # Data model
 
-PostgreSQL is the source of truth. SQLAlchemy models live in `backend/app/models.py`; the initial, frozen Alembic migration is `20261029_0001`. The application starts empty. Existing demo data is transferred only through the explicit administrator import workflow.
+MongoDB 8.0 is the source of truth. The Python/PyMongo repository stores live records in separate collections; it does not store the complete live workspace in one BSON document. Versioned collection setup is applied by `PYTHONPATH=backend python -m app.migrate` with a schema-owner credential. The schema version is `20261030_0001`. The application starts empty; existing data transfers only through an explicit administrator JSON import.
 
-## Relationships
+## Presentation diagram
 
 ```mermaid
-erDiagram
-    BUSINESS_ENTITY ||--o{ PROJECT_FAMILY : owns
-    FUNDING_SOURCE ||--o{ PROJECT_FAMILY : funds
-    PROJECT_FAMILY ||--o{ PROJECT : contains
-    PROJECT o|--o{ PROJECT : parent_of
-    PROJECT ||--o{ PROJECT_ASIC : associates
-    ASIC ||--o{ PROJECT_ASIC : associates
-    ASIC ||--o{ ASIC_MPN : has
-    ASIC ||--o{ ASIC_PRICE_HISTORY : records
-    ASIC ||--o{ PLANNING_EVENT : tracks
-    PROJECT o|--o{ PLANNING_EVENT : scopes
-    PLANNING_EVENT o|--o{ PLANNING_EVENT : canonical_request
-    FORECAST_VERSION ||--o{ FORECAST_LINE : freezes
-    BUSINESS_ENTITY {
-        text business_entity_id PK
-        text name
-    }
-    FUNDING_SOURCE {
-        text funding_source_id PK
-        text name
-    }
-    PROJECT_FAMILY {
-        text project_family_id PK
-        text business_entity_id FK
-        text funding_source_id FK
-    }
-    PROJECT {
-        text project_id PK
-        text project_family_id FK
-        text parent_project_id FK
-        text engineering_project_manager
-    }
-    ASIC {
-        text asic_id PK
-        text asic_name
-        decimal unit_price
-    }
-    PROJECT_ASIC {
-        text project_id PK,FK
-        text asic_id PK,FK
-        int shipping_time_days
-    }
-    ASIC_MPN {
-        text part_id PK
-        text asic_id FK
-        text mpn
-    }
-    ASIC_PRICE_HISTORY {
-        text asic_id PK,FK
-        string effective_quarter PK
-        decimal unit_price
-    }
-    PLANNING_EVENT {
-        text event_id PK
-        text asic_id FK
-        text project_id FK
-        text canonical_request_id FK
-        string event_type
-        bigint quantity
-        date event_date
-    }
-    FORECAST_VERSION {
-        text forecast_version_id PK
-        string version_month UK
-    }
-    FORECAST_LINE {
-        text forecast_version_id PK,FK
-        int position PK
-        string period_month
-        bigint quantity
-    }
+flowchart LR
+    BE[Business entity] --> PF[Project family]
+    FS[Funding source] --> PF
+    PF -->|One family per project; ownership inherited| P[Project]
+    P -->|ASIC IDs and transit days| A[ASIC]
+    A --> PART[Embedded DD_list part variants]
+    A --> PRICE[Embedded quarterly price history]
+    A --> E[Planning event]
+    P --> E
+    E -->|Supply, request, allocation, shipment, receipt| PLAN[Calculated availability and shortages]
+    FV[Saved forecast version] --> FL[Separate immutable forecast lines]
+    R[Recovery snapshot metadata] --> SC[Separate binary JSON chunks]
+    W[Workspace revision] -.->|Atomic transaction| E
+    W -.->|Same transaction| AU[Append-only audit]
+    AU --> AC[Separate large-detail chunks]
 ```
 
-`recovery_snapshot`, `workspace_meta`, and `audit_entry` support recovery, concurrency, and change history. They have no foreign keys to the mutable business records.
+Arrows describe application references and embedded data, not database foreign keys. A family has exactly one business entity and one funding source. The domain layer validates reference integrity, names/keys, parent cycles, deletion rules and planning limits before a transaction commits.
 
-## Tables and ownership
+## Collections and ownership
 
-| Table | Purpose and important rules |
+| Collection | Stored information and important rules |
 | --- | --- |
-| `business_entity` | Named business entity, description, optional archive timestamp. Name is unique after trimming and case folding. |
-| `funding_source` | Named funding source with the same name rules. |
-| `project_family` | Exactly one business entity and one funding source, both required foreign keys. |
-| `project` | Required family, project name and engineering project manager; optional unique project key, supply chain program manager, platform, prototype flag, parent project and description. |
-| `asic` | ASIC name, required supply chain owner, marketing name, optional unit price and description. |
-| `asic_mpn` | One row per ASIC part variant: globally unique part ID, MPN, customer part number, PLID, assembly description, and component subtype. MPN is unique within its ASIC after trimming and case folding. These columns support the DD_list detail view. |
-| `asic_price_history` | Per-ASIC prices keyed by quarter, such as `2026-Q4`; compound primary key `(asic_id, effective_quarter)`. |
-| `project_asic` | Many-to-many project/ASIC association, keyed by `(project_id, asic_id)`, with nonnegative shipping time in days. |
-| `planning_event` | Supply, request, allocation, shipment and arrival records. See event semantics below. |
-| `forecast_version` | Named forecast capture, unique version month and original capture timestamp. |
-| `forecast_line` | Ordered frozen lines keyed by `(forecast_version_id, position)`. Carries historical ASIC/project IDs and names, category, phase, event type, period month, quantity and optional source event ID. |
-| `recovery_snapshot` | Explicit recovery capture: ID, capture timestamp, label and JSONB state copy. This historical copy is not the live data source. |
-| `workspace_meta` | Singleton row `id = 1`, current workspace revision, frontend contract version and compatibility metadata. It contains no live ASIC, project, event or forecast arrays. |
-| `audit_entry` | Ordered server change ledger: ID, sequence, workspace revision, time, action, before/after change details, authenticated actor and role. Imported legacy records have an unknown actor and an explicit legacy flag. |
+| `business_entity` | Name, description and optional archive/compatibility metadata. Names are unique after trimming and case folding. |
+| `funding_source` | Funding source with the same name rules. |
+| `project_family` | Required business entity and funding source IDs; source of inherited project ownership. |
+| `project` | Required family, project name and EPM; optional key, SCPM, platform, prototype flag, parent and description. Associated ASIC IDs and per-ASIC transit settings are embedded. |
+| `asic` | Name, supply chain owner, marketing name, description and optional price. DD_list part variants and quarterly price history are embedded arrays. Part IDs are globally unique; normalized MPNs are unique within an ASIC. |
+| `planning_event` | Supply, requests, allocations, shipments and arrivals, including legacy references and shipment baselines. |
+| `forecast_version` | Saved monthly forecast header, ID, label and timestamp. Version month is unique. |
+| `forecast_line` | Ordered frozen lines stored separately from the header: historical IDs/labels, category, phase, event type, period and quantity. |
+| `recovery_snapshot` | ID, position, date, label, chunk count and SHA-256 checksum. Recovery copies are historical, not the live workspace. |
+| `snapshot_chunk` | Ordered 512 KiB binary chunks of UTF-8 snapshot JSON. |
+| `workspace_meta` | Singleton `_id: "workspace"`, schema version, revision, frontend contract version, audit sequence and compatibility `extra`. No live ASIC, project or event arrays. |
+| `audit_entry` | ID, sequence, workspace revision and server audit `record`. Large details use a chunk count and SHA-256 checksum. |
+| `audit_chunk` | Ordered 512 KiB binary chunks of large UTF-8 audit detail; append-only like its audit entry. |
 
-Project family is the only stored source of a project's business entity and funding source. The API derives `businessEntityId`, `fundingSourceId`, `entity` and `funding` on project responses for the existing frontend. Changing a family's ownership changes what all its projects inherit. An optional parent project provides hierarchy; it does not override family ownership. The domain layer rejects parent cycles, while the database rejects self-parenting and missing parents.
+Most entity documents wrap the accepted API record without renaming its fields:
 
-Most master and detail records have an explicit `position` to retain frontend ordering. Per-record `extra` JSONB fields preserve accepted legacy metadata without replacing relational fields. The workspace compatibility fields include `source` and legacy `pendingRequests`; active requests are `planning_event` rows.
+```json
+{
+  "_id": "stable-original-record-id",
+  "position": 0,
+  "record": {
+    "id": "stable-original-record-id",
+    "name": "User-entered name"
+  }
+}
+```
+
+`position` preserves frontend ordering. `record` preserves accepted compatibility fields, including part-level metadata, original timestamps, absent legacy defaults and unused transit settings. Workspace `extra` retains `source`, legacy `pendingRequests` and accepted unknown metadata; active requests are planning events.
+
+Versioned schema setup creates collection validators and indexes. IDs, audit sequences and chunk positions have uniqueness protection. Domain uniqueness for normalized names, project keys, MPNs and forecast months is checked under the global revision transaction; this also permits atomic swaps of names or keys. These business checks must not be bypassed by direct database writes. The runtime grants are mutable planning/recovery collections: `find`/`insert`/`update`/`remove`; `workspace_meta`: `find`/`update`; both audit collections: `find`/`insert`; and database-level `listCollections`/`listIndexes`. The runtime cannot create/drop collections, modify validators/indexes, bypass validation or manage users.
+
+A family's ownership is stored once. Responses derive `businessEntityId`, `fundingSourceId`, `entity` and `funding` on projects. Changing family ownership changes what its projects inherit. An optional parent provides hierarchy and does not override family ownership.
 
 ## Planning events
 
-| Stored `event_type` | Meaning | Project | Relevant dates |
+| API `type` | Meaning | Project | Relevant dates |
 | --- | --- | --- | --- |
-| `expected_ship` | Inventory available or expected to become available | Absent; supply is shared by ASIC | `event_date` is supply availability date. Metadata distinguishes expected from available inventory. |
-| `request` | User demand | Required | `event_date` is requested arrival; `requested_ship_date`, when present, is the ship-by date. |
-| `expected_fulfilment` | Explicit user allocation | Required | `event_date` is planned arrival; `available_ship_date`, when present, is planned dispatch. |
-| `actual_ship` | Recorded shipment | Required | `event_date` is dispatch; required `eta` is on or after dispatch. |
-| `actual_fulfilment` | Recorded arrival | Required | `event_date` is arrival. |
+| `expected_ship` | Available or incoming inventory | Absent; shared by ASIC | `date` is availability; `supplyStatus` distinguishes available from incoming. |
+| `request` | User demand | Required | `date` is requested arrival; `requestedShipDate`, when present, is ship-by. |
+| `expected_fulfilment` | Explicit user allocation | Required | `date` is planned arrival; `availableShipDate`, when present, is planned dispatch. |
+| `actual_ship` | Recorded shipment | Required | `date` is dispatch; required `eta` is on or after dispatch. |
+| `actual_fulfilment` | Recorded arrival | Required | `date` is arrival. |
 
-Quantity is a positive integer within JavaScript's safe integer range. Transit days are nonnegative. Request ship-by and allocation dispatch dates cannot be after their respective arrival dates. Valid dates retained from a previous event type remain compatibility metadata.
+Quantities are positive safe whole numbers and transit days are nonnegative. Request ship-by and allocation dispatch cannot be after their arrival dates. Valid historical fields retained from an earlier event type remain compatibility metadata.
 
-`request_reference` preserves the entered legacy request ID or alias. When it resolves unambiguously to a request on the same project and ASIC, the repository also stores `canonical_request_id`. Unmatched historical reference text remains available. The deferred self-reference permits an atomic transaction to add or remove related events.
+Within an ASIC/project, an exact request event ID takes precedence over a colliding alias. Without an exact match, shared legacy aliases retain FIFO behavior. Unresolved historical allocation references retain project-pool semantics; unresolved explicitly linked shipments do not credit unrelated requests. Baselines prevent completed shipments being credited to a newly created normal allocation. Reallocation creates a new target and retains shipped units on the source.
 
-Inventory availability and shortages are calculated by the Python planning service from supply and planning events. No allocation is created by reading an availability report. An allocation requires an explicit write. Availability predictions are calculated results, not additional inventory records.
+The Python planner calculates inventory, allocation backing and shortages. Reading availability never creates allocations. Predictions are calculated results, not extra inventory documents.
 
-## Historical data, deletion and audit
+## History, deletion and audit
 
-Forecast lines deliberately have no foreign keys from their historical ASIC/project/source-event IDs to live masters. Renaming or deleting a current ASIC or project therefore preserves the labels and quantities captured in an earlier forecast. The API validates new forecast captures against server data and prevents changing existing captures during normal edits. Explicit administrator import and restore workflows are separate.
+Frozen forecast labels and quantities remain valid after live masters change or disappear. Normal edits cannot rewrite saved forecasts or existing recovery points; new captures must match server-validated state. Explicit administrator import/restore is a separate workflow. Recovery points rotate at a maximum of 30 and are not database backups.
 
-Recovery snapshots retain a full JSONB state at capture time. The application keeps at most 30 recovery points, rotating the oldest when a new point is added. Normal edits cannot rewrite an existing snapshot. They are recovery artifacts in addition to the relational live tables, not a substitute for PostgreSQL backups.
+Authorized changes explicitly remove deleted live documents and related data. Domain validation protects remaining references; there are no hidden database cascades. Archive metadata does not turn deletion into archiving. Audit, forecasts and recovery can retain deleted information, so deleting a current record does not imply historical erasure.
 
-Authorized workspace updates physically delete removed current rows, with children handled explicitly before parents. Master foreign keys generally restrict deletion; there is no broad hidden cascade across business records. Forecast lines cascade only when their own forecast version is removed. Optional archive timestamps are also represented in the model; their presence does not silently turn deletion into archiving. Audit and retained recovery copies can still contain information about deleted records, so deletion from the current view does not guarantee historical erasure.
+The server ignores client audit additions, deletions and actor claims during normal edits. A successful write appends an authenticated entry. Imported legacy entries have an unknown original actor. `audit_entry.record` includes `id`, `date`, `action`, `detail`, `actor`, `actorName`, `actorRole`, `legacy` and `revision`; oversized detail is reconstructed from checksummed chunks. The runtime role has only `find` and `insert` on both audit collections. Owners and privileged operators require separate controls.
 
-The server ignores submitted client audit entries during ordinary edits. Every successful write appends an entry attributed to the authenticated actor. Administrator imports may add previously unseen legacy entries, but their actor is recorded as unknown. Existing server history cannot be replaced by a client payload. The PostgreSQL migration adds an audit trigger rejecting row `UPDATE` and `DELETE`; database owners and privileged operators must still be governed separately, including permissions for `TRUNCATE`, schema changes and backups.
+## Transactions and roles
 
-## Transactions and application roles
+MongoDB must support multi-document transactions through a replica set or compatible sharded cluster; a standalone server is unsupported. Verification used a replica set. The repository uses snapshot reads and majority write concern. A save conditionally updates the singleton revision and applies records and audit in the same transaction. Stale or competing revisions return HTTP 409 without a partial save. Returned state/revision describes one committed workspace. See [MongoDB transaction requirements](https://www.mongodb.com/docs/v8.0/core/transactions-production-consideration/).
 
-The current API exchanges a complete workspace and revision. Every read and write locks the singleton revision row while assembling or saving the relational state. A write must provide the revision it read; a stale write returns a conflict without committing any business changes. The revision increment, row changes and new audit entry commit together. Concurrent writers cannot silently overwrite one another. The repository leaves commit/rollback to the API transaction.
+The API still exchanges complete workspace JSON. Payload size and transaction work grow with retained history. Larger deployments need entity-level APIs, paginated history, load tests and a reviewed retention/export policy.
 
-Application roles are supplied by the trusted authenticated ingress: viewers read, editors change operational data, and administrators also import or restore workspaces. They are application authorization roles, not PostgreSQL accounts or row-level security policies. The hosting team must provision database credentials and least-privilege database access independently. Audit actor fields describe the authenticated application identity.
-
-This coarse workspace API suits an initial small-team deployment. It returns the complete audit and retained recovery history without silent truncation. Payload size and lock duration grow with events, forecasts, snapshots and audit records. Larger deployments should introduce resource-level endpoints, paginated history and a documented retention/export policy before increasing data volume or concurrency.
+Viewer/editor/admin are application roles supplied by trusted ingress, separate from MongoDB accounts. Users share one workspace; there is no per-business-entity document security.
 
 ## Dates, quantities and cost
 
-- Operational dates use PostgreSQL `DATE` and API `YYYY-MM-DD` values; timezone conversion does not move a ship-by date.
-- Forecast versions and periods use `YYYY-MM`; price history uses `YYYY-Qn`. API validation checks their calendar format.
-- Database-generated technical timestamps use `TIMESTAMP WITH TIME ZONE`. Original event creation/update strings are also retained verbatim because older date-only values affect request ordering. Captured forecast, recovery and audit timestamps preserve their accepted ISO representation.
-- Unit prices use `NUMERIC(12,2)`, allowing up to `9,999,999,999.99`. API validation rejects negative, nonfinite, excess-precision and out-of-range prices; database constraints provide additional protection. An unknown unit price is `NULL`, distinct from a known zero price. Historical price-unknown flags and accepted legacy metadata are retained.
-- Quantities are whole units, not currency. The database stores safe integers. Currency is not modeled as a separate field in this release; confirm the intended single reporting currency before introducing multi-currency costs.
+- Operational dates are validated `YYYY-MM-DD` strings, not BSON dates; timezone conversion does not move ship-by dates. Supported years are 0001–9999.
+- Forecast periods use `YYYY-MM`; quarterly prices use `YYYY-Qn`.
+- Creation/update/capture timestamps retain ISO text. Missing or date-only event timestamps retain historical FIFO behavior. Full timestamps compare by instant, with Pacific-day semantics where applicable.
+- USD prices remain validated JSON numbers, not `Decimal128`: finite, nonnegative, at most two decimal places, maximum `9,999,999,999.99`. Unknown is `null`, distinct from zero.
+- Quantities stay within JavaScript's safe integer range. Currency is implicit; multiple currencies require a model/API change.
+- Each BSON document has a separate [16 MiB limit](https://www.mongodb.com/docs/v8.0/core/document/). Forecast lines, recovery data and large audit details are separated; an oversized ordinary entity/metadata document is rejected with 422 before a partial save. The 32 MiB supported HTTP maximum does not waive per-document limits.
 
-Foreign keys, compound primary keys, named constraints and lookup indexes are defined in the migration. Business invariants involving multiple records—such as family inheritance, parent cycles and planning limits—are additionally validated by the Python domain layer.
+The workspace JSON contract remains version 2. Exported JSON from the PostgreSQL-backed application can be imported by an administrator; SQL schema files and database dumps cannot be loaded directly into MongoDB. See [README.md](../README.md) for transition and reviewed legacy-family mapping.

@@ -31,3 +31,23 @@ def event():
         record.update(extra)
         return record
     return make
+
+
+@pytest.fixture
+def mongo_database():
+    """Real replica-set MongoDB only; each test owns a disposable database."""
+    import os
+    import uuid
+    from app.database import bootstrap_database, create_client
+
+    uri = os.environ.get("TEST_MONGODB_URI", "")
+    if not uri:
+        pytest.skip("Requires a disposable replica-set TEST_MONGODB_URI")
+    client = create_client(uri)
+    database = client["tracker_test_" + uuid.uuid4().hex]
+    try:
+        bootstrap_database(database)
+        yield database
+    finally:
+        client.drop_database(database.name)
+        client.close()

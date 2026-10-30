@@ -75,7 +75,7 @@ def test_very_large_integer_price_is_a_validation_error(workspace):
 
 
 @pytest.mark.parametrize("value", ["bad\x00text", "bad\ud800text", "bad\udffftext"])
-def test_postgresql_incompatible_unicode_is_rejected_in_text_and_metadata(workspace, value):
+def test_invalid_unicode_is_rejected_in_text_and_metadata(workspace, value):
     workspace["asics"][0]["name"] = value
     with pytest.raises(DomainError, match="valid Unicode"):
         validate_workspace(workspace)

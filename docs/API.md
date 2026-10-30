@@ -1,13 +1,13 @@
 # API contract
 
-The Python service serves the frontend and API on the same origin. One PostgreSQL workspace is shared by all authorized users. All business writes replace a validated workspace in one transaction; a revision prevents overwriting another user's changes. The API starts empty and creates no demonstration records.
+The Python service serves the frontend and API on the same origin. One MongoDB workspace is shared by all authorized users. All business writes replace a validated workspace in one transaction; a revision prevents overwriting another user's changes. The API starts empty and creates no demonstration records.
 
 ## Endpoints
 
 | Method and path | Access | Response |
 | --- | --- | --- |
 | `GET /health/live` | Public | `{"status":"up"}` |
-| `GET /health/ready` | Public | `{"status":"ready"}` only when PostgreSQL and the expected Alembic migration are available; otherwise 503 |
+| `GET /health/ready` | Public | `{"status":"ready"}` only when the MongoDB replica set and expected collection schema are available; otherwise 503 |
 | `GET /api/me` | Assigned role | Authenticated identity and role |
 | `GET /api/workspace` | Viewer, editor, admin | `{revision,state}` plus a quoted revision `ETag` |
 | `PUT /api/workspace` | Editor or admin, subject to rules below | Committed `{revision,state}` and new `ETag` |
@@ -15,7 +15,7 @@ The Python service serves the frontend and API on the same origin. One PostgreSQ
 | `GET /api/openapi.json` | Assigned role; optional | OpenAPI specification when `ENABLE_API_DOCS=true` |
 | `GET /api/docs` | Assigned role; optional | Local API reference when `ENABLE_API_DOCS=true`; no external assets |
 
-Liveness and readiness also have `/api/health/live` and `/api/health/ready` aliases. Readiness requires migration `20261029_0001`. Health responses disclose no connection details or credentials.
+Liveness and readiness also have `/api/health/live` and `/api/health/ready` aliases. Readiness requires MongoDB schema version `20261030_0001`. Health responses disclose no connection details or credentials.
 
 ## Workspace reads and writes
 
@@ -53,9 +53,9 @@ To write, read the current envelope, edit its state, and submit the entire state
 
 The abbreviated `state` above illustrates the envelope only. Actual writes must include the complete required collections from the GET response. A successful write increments the revision and returns the canonical stored state, including inherited ownership, server-established shipment baselines and server audit entries. The client must replace its local state with that response. The supplied revision, rather than `If-Match`, controls concurrency.
 
-`operation` is `edit` by default. Explicit `import`, `restore` and `reset` operations require an administrator. `reason` is a nonempty string of at most 200 characters. A missing, invalid or stale submission saves no partial changes. Default body limit is 12 MiB, enforced before parsing both fixed-length and chunked requests.
+`operation` is `edit` by default. Explicit `import`, `restore` and `reset` operations require an administrator. `reason` is a nonempty string of at most 200 characters. A missing, invalid or stale submission saves no partial changes. Default body limit is 12 MiB, enforced before parsing both fixed-length and chunked requests. The supported maximum is 32 MiB. MongoDB also limits each BSON document to 16 MiB; oversized entity/metadata documents return 422 without a partial save. Recovery copies and large audit details are chunked internally, without changing the JSON response contract.
 
-Reads and writes hold the workspace revision row lock while serializing the relational records. The returned state and revision describe one coherent committed workspace.
+Reads use a snapshot transaction across per-entity collections. Writes conditionally advance the workspace revision and apply planning changes and append-only audit in one majority-committed MongoDB transaction. The returned state and revision describe one coherent workspace. A transaction-capable replica set or compatible sharded cluster is mandatory; standalone MongoDB is unsupported. The verified deployment used a replica set.
 
 ## Availability
 
@@ -84,11 +84,11 @@ Within an ASIC/project, an exact request event ID takes precedence over a collid
 
 - Each project belongs to one project family. Each family has exactly one business entity and one funding source. Project ownership IDs and display labels are derived from its family on every write. Legacy projects require an explicit mapping; imports never guess families.
 - IDs remain stable. Part IDs are globally unique, project parent relationships cannot cycle, and referenced live records must exist. Quantities are positive safe whole numbers; totals cannot exceed JavaScript's safe integer range. Dates, transit days and calculated ship dates are bounded.
-- USD prices fit PostgreSQL `NUMERIC(12,2)`: finite nonnegative values with at most two decimal places. The server rejects values requiring database rounding.
-- Indexed project keys and lowercase part MPNs are limited to 2,000 UTF-8 bytes to fit PostgreSQL indexes; master names remain limited to 500 characters. Descriptions are not subjected to these index limits. Text must be valid Unicode without NUL or unpaired surrogate characters.
+- USD prices are finite nonnegative JSON numbers with at most two decimal places and a maximum of `9,999,999,999.99`. The server rejects values requiring rounding; storage does not change the public JSON representation.
+- Project keys and lowercase part MPNs retain the 2,000 UTF-8 byte contract limit; master names remain limited to 500 characters. Descriptions are not subjected to these index limits. Text must be valid Unicode without NUL or unpaired surrogate characters.
 - Existing planning event types and allocation creation/baseline fields are immutable during normal edits. Allocation quantity cannot fall below already shipped units.
 - Saved forecast versions and recovery points are immutable during normal edits. New forecast lines must capture the current server-validated plan; new recovery data must capture the prior server workspace. Frozen forecast labels/IDs remain valid after live masters are deleted. Explicit administrator import/restore preserves reviewed historical records.
-- Normal writes ignore client audit additions, deletions and actor fields. The server appends a record with the authenticated actor, revision and before/after changes. Imported legacy entries are marked as legacy with an unknown original actor. PostgreSQL rejects audit updates/deletions.
+- Normal writes ignore client audit additions, deletions and actor fields. The server appends a record with the authenticated actor, revision and before/after changes. Imported legacy entries are marked as legacy with an unknown original actor. The restricted MongoDB runtime account can find/insert audit entries and detail chunks, and cannot update or delete them.
 
 ## Identity and authorization
 
@@ -138,4 +138,4 @@ Application errors use a structured `detail` object:
 | 422 | `invalid_workspace` with optional `errors` array; `invalid_date`; `integrity_conflict` | Correct data; no partial update was saved |
 | 503 | `database_unavailable`, `database_unconfigured` | Hosting team checks DB connectivity/configuration |
 
-Framework envelope-validation errors use FastAPI's standard `detail` array, including the invalid field location. Database errors never return raw SQL, connection credentials or stack traces. Unknown API paths return 404.
+Framework envelope-validation errors use FastAPI's standard `detail` array, including the invalid field location. Database errors never return raw driver commands, connection credentials or stack traces. Unknown API paths return 404.

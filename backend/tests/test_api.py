@@ -1,5 +1,7 @@
 from copy import deepcopy
 import json
+import os
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -8,14 +10,20 @@ from app.auth import Actor, actor_for_request
 from app.config import Settings
 from app.domain import capture_forecast_lines, empty_state
 from app.main import create_app
-from app.models import Base
-from sqlalchemy import text
+from app.database import SCHEMA_COLLECTION, SCHEMA_DOCUMENT_ID, SCHEMA_VERSION, validators
+from pymongo.errors import BulkWriteError, InvalidOperation
+
+
+def settings_for(mongo_database, **overrides):
+    values = {"mongodb_uri": os.environ["TEST_MONGODB_URI"], "mongodb_database": mongo_database.name,
+        "auth_mode": "development", "frontend_dir": None}
+    values.update(overrides)
+    return Settings(**values)
 
 
 @pytest.fixture
-def api():
-    app = create_app(Settings(database_url="sqlite+pysqlite://", auth_mode="development", frontend_dir=None, require_migrations=False))
-    Base.metadata.create_all(app.state.engine)
+def api(mongo_database):
+    app = create_app(settings_for(mongo_database))
     with TestClient(app) as client:
         yield app, client
 
@@ -37,7 +45,7 @@ def test_empty_shared_workspace_and_health(api):
     assert client.get("/api/me").json()["auth_mode"] == "development"
 
 
-def test_relational_round_trip_and_server_audit(api, workspace):
+def test_document_round_trip_and_server_audit(api, workspace):
     app, client = api
     response = put(client, workspace)
     assert response.status_code == 200, response.text
@@ -156,6 +164,58 @@ def test_unstorable_client_values_return_validation_error_and_preserve_state(api
     assert client.get("/api/workspace").json() == first
 
 
+def test_unsupported_bson_integer_is_rejected_and_transaction_rolls_back(api, workspace):
+    app, client = api
+    first = put(client, workspace).json()
+    changed = deepcopy(first["state"])
+    changed["projects"][0]["name"] = "Must not partially save"
+    changed["source"] = {"largeOpaqueInteger": 10**100}
+    response = put(client, changed, revision=first["revision"])
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "invalid_workspace"
+    assert client.get("/api/workspace").json() == first
+
+
+def test_bulk_document_validation_failure_returns_422_and_rolls_back_all_writes(api, mongo_database, workspace):
+    app, client = api
+    first = put(client, workspace).json()
+    mongo_database.command({"collMod": "project", "validator": {"$and": [
+        validators()["project"], {"record.requiresDatabaseFlag": True}]}})
+    changed = deepcopy(first["state"])
+    changed["businessEntities"][0]["name"] = "Must roll back the earlier collection write"
+    changed["projects"][0]["name"] = "Private project proposal must not be echoed"
+    response = put(client, changed, revision=first["revision"])
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"]["code"] == "invalid_workspace"
+    assert "Private project proposal" not in response.text
+    assert client.get("/api/workspace").json() == first
+
+
+@pytest.mark.parametrize("codes,write_concern,status,detail_code", [
+    ([11000], [], 422, "integrity_conflict"),
+    ([121, 11000], [], 422, "invalid_workspace"),
+    ([91], [], 503, "database_unavailable"),
+    ([121, 91], [], 503, "database_unavailable"),
+    ([121], [{"code": 64, "errmsg": "Private write concern error"}], 503, "database_unavailable"),
+    ([], [], 503, "database_unavailable"),
+])
+def test_bulk_write_error_responses_are_sanitized_and_keep_service_failures(api, codes, write_concern, status, detail_code):
+    app, client = api
+
+    @app.put("/api/test/bulk-error")
+    def failing_operation():
+        # Fault injection exercises the public error boundary without requiring
+        # a server shutdown/failpoint or printing the driver's state-bearing op.
+        raise BulkWriteError({"writeErrors": [{"code": code, "errmsg": "Private bulk error",
+            "op": {"record": {"secret": "Private workspace value"}}} for code in codes],
+            "writeConcernErrors": write_concern})
+
+    response = client.put("/api/test/bulk-error")
+    assert response.status_code == status
+    assert response.json()["detail"]["code"] == detail_code
+    assert "Private" not in response.text
+
+
 @pytest.mark.parametrize("reason", ["   ", "\t\n", "bad\x00reason", "bad\ud800reason"])
 def test_invalid_operation_reason_cannot_poison_the_server_audit(api, workspace, reason):
     app, client = api
@@ -186,17 +246,15 @@ def test_invalid_envelope_values_cannot_break_validation_error_serialization(api
     assert client.get("/api/workspace").json()["revision"] == 0
 
 
-def test_chunked_body_limit_is_enforced_without_content_length():
-    app = create_app(Settings(database_url="sqlite+pysqlite://", auth_mode="development", frontend_dir=None, require_migrations=False, max_body_bytes=1024))
-    Base.metadata.create_all(app.state.engine)
+def test_chunked_body_limit_is_enforced_without_content_length(mongo_database):
+    app = create_app(settings_for(mongo_database, max_body_bytes=1024))
     with TestClient(app) as client:
         result = client.put("/api/workspace", content=iter([b"x" * 800, b"x" * 800]), headers={"Content-Type": "application/json"})
         assert result.status_code == 413
 
 
-def test_proxy_authentication_requires_gateway_secret_and_assigned_group():
-    app = create_app(Settings(database_url="sqlite+pysqlite://", auth_mode="proxy", proxy_shared_secret="s" * 32, frontend_dir=None, require_migrations=False))
-    Base.metadata.create_all(app.state.engine)
+def test_proxy_authentication_requires_gateway_secret_and_assigned_group(mongo_database):
+    app = create_app(settings_for(mongo_database, auth_mode="proxy", proxy_shared_secret="s" * 32))
     with TestClient(app) as client:
         assert client.get("/api/me").status_code == 401
         assert client.get("/api/me", headers={"X-Authenticated-User": "forged", "X-Authenticated-Groups": "asic-tracker-admins"}).status_code == 401
@@ -208,9 +266,8 @@ def test_proxy_authentication_requires_gateway_secret_and_assigned_group():
         assert client.get("/health/live").status_code == 200
 
 
-def test_proxy_json_group_claim_accepts_whitespace_and_rejects_parser_limits():
-    app = create_app(Settings(database_url="sqlite+pysqlite://", auth_mode="proxy", proxy_shared_secret="s" * 32, frontend_dir=None, require_migrations=False))
-    Base.metadata.create_all(app.state.engine)
+def test_proxy_json_group_claim_accepts_whitespace_and_rejects_parser_limits(mongo_database):
+    app = create_app(settings_for(mongo_database, auth_mode="proxy", proxy_shared_secret="s" * 32))
     trusted = {"X-Proxy-Token": "s" * 32, "X-Authenticated-User": "authenticated-subject"}
     with TestClient(app) as client:
         result = client.get("/api/me", headers={**trusted, "X-Authenticated-Groups": '  ["asic-tracker-viewers"] '})
@@ -221,8 +278,8 @@ def test_proxy_json_group_claim_accepts_whitespace_and_rejects_parser_limits():
             assert result.json()["detail"]["code"] == "invalid_groups"
 
 
-def test_missing_proxy_secret_fails_closed_at_startup():
-    app = create_app(Settings(database_url="sqlite+pysqlite://", auth_mode="proxy", frontend_dir=None, require_migrations=False))
+def test_missing_proxy_secret_fails_closed_at_startup(mongo_database):
+    app = create_app(settings_for(mongo_database, auth_mode="proxy"))
     with pytest.raises(ValueError, match="PROXY_SHARED_SECRET"):
         with TestClient(app):
             pass
@@ -237,7 +294,7 @@ def test_security_headers_and_optional_docs_have_no_external_assets(api):
     assert client.get("/api/docs").status_code == 404
 
 
-def test_forecast_and_recovery_history_are_verified_after_relational_round_trip(api, workspace, event):
+def test_forecast_and_recovery_history_are_verified_after_document_round_trip(api, workspace, event):
     app, client = api
     workspace["events"] = [event("r", "request", 5, "2026-11-01")]
     first = put(client, workspace).json()
@@ -263,21 +320,18 @@ def test_forecast_and_recovery_history_are_verified_after_relational_round_trip(
     assert client.get("/api/workspace").json() == committed
 
 
-def test_readiness_rejects_stale_migration_revision():
-    app = create_app(Settings(database_url="sqlite+pysqlite://", auth_mode="development", frontend_dir=None))
-    Base.metadata.create_all(app.state.engine)
-    with app.state.engine.begin() as connection:
-        connection.execute(text("CREATE TABLE alembic_version (version_num VARCHAR(32) PRIMARY KEY)"))
-        connection.execute(text("INSERT INTO alembic_version VALUES ('stale-revision')"))
+def test_readiness_rejects_stale_schema_version(mongo_database):
+    mongo_database[SCHEMA_COLLECTION].update_one({"_id": SCHEMA_DOCUMENT_ID},
+        {"$set": {"schema_version": "stale-version"}}, bypass_document_validation=True)
+    app = create_app(settings_for(mongo_database))
     with TestClient(app) as client:
         assert client.get("/health/ready").status_code == 503
-        with app.state.engine.begin() as connection:
-            connection.execute(text("UPDATE alembic_version SET version_num = '20261029_0001'"))
+        mongo_database[SCHEMA_COLLECTION].update_one({"_id": SCHEMA_DOCUMENT_ID}, {"$set": {"schema_version": SCHEMA_VERSION}})
         assert client.get("/health/ready").status_code == 200
 
 
 @pytest.mark.parametrize("missing", ["directory", "index", "script", "stylesheet"])
-def test_missing_configured_frontend_fails_startup(tmp_path, missing):
+def test_missing_configured_frontend_fails_startup(mongo_database, tmp_path, missing):
     frontend = tmp_path / "frontend"
     if missing != "directory":
         frontend.mkdir()
@@ -287,22 +341,86 @@ def test_missing_configured_frontend_fails_startup(tmp_path, missing):
             (frontend / "app.js").write_text("/* app */")
         if missing != "stylesheet":
             (frontend / "styles.css").write_text("body {}")
-    app = create_app(Settings(database_url="sqlite+pysqlite://", auth_mode="development", frontend_dir=frontend, require_migrations=False))
+    app = create_app(settings_for(mongo_database, frontend_dir=frontend))
     with pytest.raises(ValueError, match="FRONTEND_DIR"):
         with TestClient(app):
             pass
 
 
-def test_complete_frontend_and_api_only_configuration_still_start(tmp_path):
+def test_complete_frontend_and_api_only_configuration_still_start(mongo_database, tmp_path):
     (tmp_path / "index.html").write_text('<script src="app.js?v=1"></script><link rel="stylesheet" href="styles.css">')
     (tmp_path / "app.js").write_text("/* app */")
     (tmp_path / "styles.css").write_text("body {}")
-    app = create_app(Settings(database_url="sqlite+pysqlite://", auth_mode="development", frontend_dir=tmp_path, require_migrations=False))
+    app = create_app(settings_for(mongo_database, frontend_dir=tmp_path))
     with TestClient(app) as client:
         assert client.get("/").status_code == 200
         assert client.get("/app.js?v=1").status_code == 200
         assert client.get("/health/live").status_code == 200
-    app = create_app(Settings(database_url="sqlite+pysqlite://", auth_mode="development", frontend_dir=None, require_migrations=False))
+    app = create_app(settings_for(mongo_database))
     with TestClient(app) as client:
         assert client.get("/health/live").status_code == 200
         assert client.get("/").status_code == 404
+
+
+def test_mongo_client_is_closed_when_application_lifespan_ends(mongo_database):
+    app = create_app(settings_for(mongo_database))
+    with TestClient(app) as client:
+        mongo_client = app.state.mongo_client
+        assert client.get("/health/ready").status_code == 200
+        assert mongo_client.admin.command("ping")["ok"] == 1
+    assert app.state.mongo_client is None and app.state.database is None
+    with pytest.raises(InvalidOperation):
+        mongo_client.admin.command("ping")
+
+
+def test_transaction_reads_and_writes_use_primary_despite_uri_read_preference(mongo_database, workspace):
+    parts = urlsplit(os.environ["TEST_MONGODB_URI"])
+    query = [(key, value) for key, value in parse_qsl(parts.query) if key.lower() != "readpreference"]
+    uri = urlunsplit(parts._replace(query=urlencode([*query, ("readPreference", "secondaryPreferred")])))
+    app = create_app(settings_for(mongo_database, mongodb_uri=uri))
+    with TestClient(app) as client:
+        assert client.get("/api/workspace").status_code == 200
+        response = put(client, workspace, revision=0)
+        assert response.status_code == 200, response.text
+        assert response.json()["revision"] == 1
+
+
+def test_readiness_rejects_missing_bootstrap_metadata(mongo_database):
+    mongo_database[SCHEMA_COLLECTION].delete_one({"_id": SCHEMA_DOCUMENT_ID})
+    app = create_app(settings_for(mongo_database))
+    with TestClient(app) as client:
+        assert client.get("/health/live").status_code == 200
+        assert client.get("/health/ready").status_code == 503
+
+
+def test_readiness_rejects_missing_required_index(mongo_database):
+    index = next((name, item["name"]) for name in mongo_database.list_collection_names()
+        for item in mongo_database[name].list_indexes() if item["name"] != "_id_")
+    mongo_database[index[0]].drop_index(index[1])
+    app = create_app(settings_for(mongo_database))
+    with TestClient(app) as client:
+        assert client.get("/health/ready").status_code == 503
+
+
+def test_mongodb_uri_file_and_database_name_configuration(monkeypatch, tmp_path):
+    uri = "mongodb://test-user:placeholder-password@127.0.0.1:27017/?replicaSet=rs0"
+    secret = tmp_path / "mongodb-uri.txt"
+    secret.write_text(uri + "\n")
+    monkeypatch.delenv("MONGODB_URI", raising=False)
+    monkeypatch.setenv("MONGODB_URI_FILE", str(secret))
+    monkeypatch.setenv("MONGODB_DATABASE", "tracker_test")
+    monkeypatch.setenv("AUTH_MODE", "development")
+    settings = Settings.from_env()
+    settings.validate()
+    assert settings.mongodb_uri == uri and settings.mongodb_database == "tracker_test"
+    assert "placeholder-password" not in repr(settings)
+    monkeypatch.setenv("MONGODB_URI", "")
+    with pytest.raises(ValueError, match="MONGODB_URI or MONGODB_URI_FILE"):
+        Settings.from_env()
+
+
+@pytest.mark.parametrize("database", ["", "invalid.name", "space name", "x" * 64])
+def test_invalid_mongodb_database_names_fail_before_connection(database):
+    settings = Settings(mongodb_uri="mongodb://127.0.0.1:27017", mongodb_database=database, auth_mode="development", frontend_dir=None)
+    with pytest.raises(ValueError, match="MONGODB_DATABASE"):
+        settings.validate()

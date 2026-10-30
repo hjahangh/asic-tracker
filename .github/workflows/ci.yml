@@ -12,22 +12,9 @@ jobs:
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_USER: tracker_test
-          POSTGRES_PASSWORD: ci-only-disposable-password
-          POSTGRES_DB: tracker_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U tracker_test -d tracker_test"
-          --health-interval 5s --health-timeout 5s --health-retries 15
     env:
       PYTHONPATH: ${{ github.workspace }}/backend
-      DATABASE_URL: postgresql+psycopg://tracker_test:ci-only-disposable-password@127.0.0.1:5432/tracker_test
-      TEST_DATABASE_URL: postgresql+psycopg://tracker_test:ci-only-disposable-password@127.0.0.1:5432/tracker_test
+      MONGODB_DATABASE: asic_tracker_ci
       AUTH_MODE: development
     steps:
       - uses: actions/checkout@v7
@@ -42,19 +29,42 @@ jobs:
         with:
           node-version: '22'
           package-manager-cache: false
+      - name: Start authenticated disposable MongoDB replica set
+        run: |
+          python3 scripts/bootstrap_dev.py
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          values = dict(line.split('=', 1) for line in Path('.env').read_text().splitlines() if line and not line.startswith('#'))
+          for name, value in values.items():
+              if name.endswith('_PASSWORD'):
+                  print('::add-mask::' + value)
+          uri = 'mongodb://' + values['MONGO_ROOT_USER'] + ':' + values['MONGO_ROOT_PASSWORD'] + '@127.0.0.1:27017/admin?authSource=admin&replicaSet=tracker-rs&directConnection=true'
+          print('::add-mask::' + uri)
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              stream.write('MONGODB_URI=' + uri + '\nTEST_MONGODB_URI=' + uri + '\n')
+          Path(os.environ['RUNNER_TEMP'], 'mongodb-ci.yaml').write_text('services:\n  db:\n    ports:\n      - "127.0.0.1:27017:27017"\n')
+          PY
+          docker compose -f compose.yaml -f "$RUNNER_TEMP/mongodb-ci.yaml" up -d --wait --wait-timeout 240 db
+          docker compose -f compose.yaml -f "$RUNNER_TEMP/mongodb-ci.yaml" run --rm --no-deps setup-db
       - name: Install locked test dependencies
         run: python -m pip install --require-hashes -r backend/requirements-dev.txt
-      - name: Check PostgreSQL migrations
-        working-directory: backend
+      - name: Bootstrap and check MongoDB schema
         run: |
-          alembic upgrade head
-          alembic check
-      - name: Test Python API, relational storage, planner, and migration converter
+          python -m app.migrate
+          python -m app.migrate --check
+      - name: Test Python API, MongoDB persistence, planner and conversion
         run: python -m pytest backend/tests -q
       - name: Test JavaScript frontend
         run: node --test frontend/tests/*.test.cjs
       - name: Check planner conservation and browser/API parity
         run: python scripts/check_planners.py
+      - name: Remove disposable test database
+        if: always()
+        run: |
+          if [ -f .env ] && [ -f "$RUNNER_TEMP/mongodb-ci.yaml" ]; then
+            docker compose -f compose.yaml -f "$RUNNER_TEMP/mongodb-ci.yaml" down -v --remove-orphans
+          fi
 
   container:
     runs-on: ubuntu-latest
@@ -63,10 +73,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - name: Create disposable local test credentials
+      - name: Create disposable local test credentials and keyfile
         run: python3 scripts/bootstrap_dev.py
       - name: Build and start the full stack
-        run: docker compose up --build --wait --wait-timeout 180
+        run: docker compose up --build --wait --wait-timeout 240
       - name: Check served frontend and API
         run: |
           curl --fail --retry 5 --retry-delay 2 http://127.0.0.1:8080/health/ready

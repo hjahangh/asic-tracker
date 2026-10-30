@@ -1,18 +1,12 @@
-"""HTTP integration against real Alembic migrations in a disposable PG schema."""
+"""End-to-end HTTP workflows against versioned real MongoDB collections."""
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import hashlib
 import os
-from pathlib import Path
 from threading import Barrier
-import uuid
 
-from alembic import command
-from alembic.config import Config
 from fastapi.testclient import TestClient
 import pytest
-from sqlalchemy import create_engine, text
-from sqlalchemy.engine import make_url
 
 from app.config import Settings
 from app.domain import capture_forecast_lines
@@ -20,30 +14,11 @@ from app.main import create_app
 
 
 @pytest.fixture
-def migrated_api(monkeypatch):
-    database_url = os.environ.get("TEST_DATABASE_URL", "")
-    if not database_url.startswith("postgresql"):
-        pytest.skip("Requires disposable PostgreSQL TEST_DATABASE_URL")
-    raw = create_engine(database_url)
-    schema = "tracker_api_" + uuid.uuid4().hex
-    with raw.begin() as connection:
-        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
-    scoped_url = make_url(database_url).update_query_dict({"options": "-csearch_path=" + schema}).render_as_string(hide_password=False)
-    monkeypatch.setenv("DATABASE_URL", scoped_url)
-    monkeypatch.delenv("DATABASE_URL_FILE", raising=False)
-    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
-    app = None
-    try:
-        command.upgrade(config, "head")
-        app = create_app(Settings(database_url=scoped_url, auth_mode="proxy", proxy_shared_secret="integration-secret-" + "s" * 32, frontend_dir=None))
-        with TestClient(app) as client:
-            yield app, client
-    finally:
-        if app is not None:
-            app.state.engine.dispose()
-        with raw.begin() as connection:
-            connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
-        raw.dispose()
+def migrated_api(mongo_database):
+    app = create_app(Settings(mongodb_uri=os.environ["TEST_MONGODB_URI"], mongodb_database=mongo_database.name,
+        auth_mode="proxy", proxy_shared_secret="integration-secret-" + "s" * 32, frontend_dir=None))
+    with TestClient(app) as client:
+        yield app, client
 
 
 def headers(role="admin", subject="integration-reviewer"):
@@ -51,8 +26,8 @@ def headers(role="admin", subject="integration-reviewer"):
         "X-Authenticated-Groups": "asic-tracker-" + role + "s"}
 
 
-@pytest.mark.postgres
-def test_migrated_postgresql_http_workflow_retains_frozen_history(migrated_api, workspace, event):
+@pytest.mark.mongodb
+def test_migrated_mongodb_http_workflow_retains_frozen_history(migrated_api, workspace, event):
     app, client = migrated_api
     assert client.get("/health/ready").status_code == 200
     assert client.get("/api/workspace").status_code == 401
@@ -91,7 +66,7 @@ def test_migrated_postgresql_http_workflow_retains_frozen_history(migrated_api, 
     assert client.get("/api/workspace", headers=headers()).json() == saved
 
 
-@pytest.mark.postgres
+@pytest.mark.mongodb
 def test_concurrent_http_writers_receive_conflict_without_losing_winner(migrated_api, workspace):
     app, client = migrated_api
     response = client.put("/api/workspace", headers=headers(), json={"revision": 0, "state": workspace})
@@ -119,7 +94,7 @@ def test_concurrent_http_writers_receive_conflict_without_losing_winner(migrated
     assert final["state"]["audit"][-1]["actor"] == winner
 
 
-@pytest.mark.postgres
+@pytest.mark.mongodb
 def test_indexed_text_bounds_return_validation_errors_without_database_failure(migrated_api, workspace):
     app, client = migrated_api
     incompressible = "".join(hashlib.sha256(str(index).encode()).hexdigest() for index in range(160))

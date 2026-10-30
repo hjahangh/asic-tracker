@@ -83,8 +83,8 @@ def _safe_json(value: object, depth: int = 0, path: tuple = ()) -> None:
     elif isinstance(value, float) and not math.isfinite(value):
         raise DomainError("Workspace numbers must be finite.")
     elif isinstance(value, str) and INVALID_TEXT.search(value):
-        # PostgreSQL text/JSONB cannot store NUL or unpaired UTF-16 surrogates.
-        # Reject these as invalid input before a database error or UTF-8 encode.
+        # Keep the portable workspace text contract valid for BSON and UTF-8.
+        # Reject NUL/unpaired surrogates before storage or response encoding.
         raise DomainError("Workspace text must be valid Unicode without null characters.")
 
 
@@ -198,8 +198,7 @@ def validate_workspace(payload: dict, *, _snapshot: bool = False) -> dict:
             if not isinstance(mpn, str) or not mpn.strip():
                 errors.append(f"{label}: each populated part row needs an MPN.")
             elif len(mpn.strip().lower().encode("utf-8")) > MAX_INDEXED_TEXT_BYTES:
-                # Leave room for the ASIC ID and PostgreSQL B-tree tuple
-                # overhead in the compound case-insensitive uniqueness index.
+                # Retain the portable workspace format's bounded MPN keys.
                 errors.append(f"{label}: each part MPN must fit within {MAX_INDEXED_TEXT_BYTES} UTF-8 bytes after lowercase normalization.")
             elif mpn.strip().casefold() in mpns:
                 errors.append(f"{label}: part MPNs must be unique within this ASIC.")
@@ -336,7 +335,7 @@ def validate_workspace(payload: dict, *, _snapshot: bool = False) -> dict:
                 errors.append(f"Snapshot {snapshot['label']}: {error.errors[0]}")
     if errors:
         raise DomainError(errors)
-    # Calendar subtraction must also remain inside PostgreSQL/browser's shared
+    # Calendar subtraction must also remain inside Python/browser's shared
     # supported years. Valid input dates alone do not prevent underflow.
     for event in state["events"]:
         try:

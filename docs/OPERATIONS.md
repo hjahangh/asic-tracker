@@ -2,53 +2,66 @@
 
 ## Health and logs
 
-`GET /health/live` reports that the Python process is responding. `GET /health/ready` checks database access, workspace metadata, and the expected Alembic revision. Both are unauthenticated and return no planning data. The Docker health check uses readiness. Configure platform liveness/readiness separately where supported.
+`GET /health/live` reports that Python is responding. `GET /health/ready` verifies MongoDB access, replica-set transaction support, workspace metadata and schema version `20261030_0001`. Both are unauthenticated and return no planning data. The Docker health check uses readiness; configure separate platform liveness/readiness where supported. A standalone MongoDB server is unsupported.
 
-The service logs to stdout/stderr. Collect logs through the platform, restrict access, and avoid logging identity headers, gateway tokens, DB URLs, JSON request bodies, or exports. The database stores the authenticated actor, operation reason, and a before/after change summary in its append-only audit. Imported legacy audit entries are marked as legacy with unknown actor; they cannot become authenticated server audit entries.
+Collect stdout/stderr through the platform with restricted access. Avoid logging identity headers, gateway tokens, MongoDB URIs, JSON bodies or exports. The append-only audit stores authenticated actor, operation reason and before/after changes. Imported legacy actors remain unknown.
 
-## Release and migration sequence
+## Release and schema sequence
 
-1. Run CI and required internal scans. Build/promote an immutable application image.
-2. Take a recoverable database backup and confirm its restore procedure. Review the migration on a restored staging database.
-3. Stop or drain writes if the migration is not backward compatible. Run one `alembic upgrade head` job with the migration-owner credential. For the supplied Compose deployment, run `docker compose --env-file .env.production -f compose.production.yaml run --rm --no-deps migrate` explicitly for each release; do not rely on a previously completed job container being rerun automatically.
-4. Update the explicit table list in `scripts/grant_runtime.sql` when tables change, then reapply reviewed runtime grants. Check `alembic current`, `alembic check`, and readiness using the new image.
-5. Roll out/recreate the app with the approved image. Perform an authenticated smoke test, then reopen traffic.
+1. Run CI and internal scans; build/promote an immutable image.
+2. Take a recoverable database backup and review the schema change on a restored staging replica set.
+3. Stop/drain application traffic and wait for in-flight transactions to finish when the release needs maintenance. Run one owner-credential `PYTHONPATH=backend python -m app.migrate` job. With production Compose, explicitly run `docker compose --env-file .env.production -f compose.production.yaml run --rm --no-deps migrate` for each release; a previously completed job is not automatically rerun on every deployment.
+4. Review runtime grants when collections change, then reapply them with `mongosh --nodb --quiet --file scripts/setup_mongodb.js` using the database administrator credential and reviewed user/password secret inputs from [HOSTING.md](HOSTING.md). Run `PYTHONPATH=backend python -m app.migrate --check` with the owner credential and verify readiness with the restricted runtime credential.
+5. Recreate the app with the approved image, smoke test authenticated roles and planning flows, then reopen traffic.
 
-Application startup never runs migrations. Every deployment must coordinate the migration job. There is one initial revision, `20261029_0001`; future schema changes must add a new revision and update the backend readiness revision expectation. Never edit an already deployed migration.
+Application startup never creates collections or applies migrations. Setup is versioned Python code, not SQL/Alembic. Current version is `20261030_0001`; future changes must add reviewed versioned steps and update readiness expectations. Keep owner credentials out of the runtime container.
 
-Application rollback is safe only when the older app is compatible with the current schema. Alembic downgrade commands may destroy data; do not use downgrade as an unattended rollback mechanism. If recovery needs a database restore, restore into an isolated database first, validate it, and switch over under the hosting team's approved procedure.
+Rollback is safe only when the older image supports the current document schema. There is no automatic destructive downgrade. For database recovery, restore into an isolated environment, validate, then switch under the hosting team's procedure.
 
 ## Backups and restore
 
-In-app recovery snapshots capture planning state for user mistake recovery. They share the same database and are not a backup of the service, its audit trail, or the PostgreSQL cluster. Browser JSON exports are also not a substitute for database backups.
+In-app recovery points and JSON exports help recover user mistakes and transfer planning state. They do not back up the complete MongoDB service, audit provenance, users or operational configuration.
 
-Use your platform's PostgreSQL backup/PITR service, or scheduled encrypted `pg_dump` custom-format backups with retention and access control. Back up schema/migration state, planning rows, forecasts, recovery snapshots, and audit. Save role/grant configuration separately. Use a client version compatible with the server. For example, with the backup URL injected securely by the platform and a protected destination directory:
+Use the platform's consistent MongoDB snapshot/PITR service where available. For a logical `mongodump` of this multi-collection application, **stop all application replicas and every other writer to this application database**, including migration jobs and direct database tools, and wait for in-flight transactions to finish. Keep writes stopped until the dump completes. Without this maintenance boundary, a collection-by-collection dump can combine different workspace revisions. A single-member development replica set provides transaction support, not redundancy.
 
-```sh
-pg_dump --dbname="$BACKUP_PSQL_URL" --format=custom --no-owner --no-acl --file=/secure-backups/asic-tracker.dump
-pg_restore --list /secure-backups/asic-tracker.dump
-```
+Use MongoDB Database Tools compatible with MongoDB 8.0; use the same tools version for dump and restore, and matching server major/feature compatibility versions. Keep credentials in a protected tools YAML file supplied by the secret store, separate from the application runtime secret. For example, `/run/secrets/mongodb-backup.yaml` contains a `uri` and, if needed, a separate `password`; do not put credentials on the command line. See [Database Tools configuration](https://www.mongodb.com/docs/database-tools/mongodump/) and [restore compatibility](https://www.mongodb.com/docs/database-tools/mongodump/mongodump-behavior/).
 
-Test restores regularly into a newly provisioned isolated database:
+With traffic stopped and a protected, nonexisting output path:
 
 ```sh
-pg_restore --dbname="$RESTORE_TEST_PSQL_URL" --no-owner --no-acl --exit-on-error /secure-backups/asic-tracker.dump
+mongodump --config=/run/secrets/mongodb-backup.yaml --db=asic_tracker --archive=/secure-backups/asic-tracker.archive.gz --gzip
 ```
 
-The restore URL must name that empty test database, never the live database. Reapply reviewed runtime grants, verify the migration revision and record totals, and smoke test a separate app instance. Record restore duration and compare it to agreed RPO/RTO. There is deliberately no destructive restore script with a default target in this package.
+Use a dedicated backup identity, retention, encryption and access controls. Capture all application collections, including schema/workspace metadata, both audit collections and snapshot chunks. Save database users/roles, replica-set/TLS settings, approved image digest and secret references separately. The single-database archive does not constitute a cluster/configuration backup.
+
+Test a restore into a **new isolated replica set/database** with a separate restore credential, not the live endpoint. The following example maps the source database `asic_tracker` to the fresh database `asic_tracker_restore`:
+
+```sh
+mongorestore --config=/run/secrets/mongodb-restore-test.yaml --archive=/secure-backups/asic-tracker.archive.gz --gzip --nsInclude='asic_tracker.*' --nsFrom='asic_tracker.*' --nsTo='asic_tracker_restore.*' --stopOnError
+```
+
+The restore YAML must point only at the isolated test deployment. **Omit the database path from the tools URI** when using archive namespace filters/remapping: use `mongodb://RESTORE_USER@restore-host:27017/?authSource=admin&replicaSet=rs0&tls=true`, with the password in the protected YAML `password` field. Set the actual authentication database through `authSource`; do not put `/admin` or an application database before `?`. This differs from an application URI, which may include a database path. The archive source and destination are selected by `--nsInclude`/`--nsFrom`/`--nsTo`. In testing, a URI with `/admin` silently filtered this archive to zero restored documents even though the tool exited successfully. Confirm the target name before execution. No `--drop` is needed for a new database. Restore collection options/indexes, apply reviewed runtime roles separately, and check the schema with `MONGODB_DATABASE=asic_tracker_restore`. Require the expected nonzero collection/document counts; a zero exit code alone does not establish a successful restore. Start a separate app against it and compare exact canonical state, revision, audit sequences/details, checksummed chunks, forecasts and recovery points. Record restore time against RPO/RTO. Reopen original traffic only after the backup succeeds; switching to restored data requires a separate approved cutover.
+
+These commands assume the database is named `asic_tracker`; substitute the configured name in every namespace if different. The hosting team must validate its managed-service backup/restore permissions and tooling. See [mongorestore options](https://www.mongodb.com/docs/database-tools/mongorestore/).
 
 ## Conflicts and failed saves
 
-A stale revision returns HTTP 409. The frontend retains the draft and offers Download draft/Load latest; it does not silently retry or overwrite newer data. Preserve the draft, load the latest workspace, and reapply the intended change. An interrupted response may occur after a server commit; load latest before retrying instead of assuming the save failed.
+A stale revision returns HTTP 409. The frontend retains a downloadable draft and requires loading latest; it does not silently retry or overwrite. Preserve the draft, reload authoritative data, and reapply the intended change. An interrupted response can occur after commit; reload before assuming the write failed.
 
-Database integrity/validation failures return 422 without a partial update. Database outages return 503. Once connectivity recovers, reload authoritative state before resuming edits. There is no offline browser-write queue or local-storage fallback.
+Validation/integrity failures return 422 without partial changes. Database outages return 503. Once connectivity recovers, reload before editing. There is no offline write queue or browser-local authority.
 
 ## History growth and retention
 
-Audit history is retained, and saved forecasts remain until an administrator explicitly deletes or replaces them through an authorized workflow. Recovery points rotate at a documented maximum of 30; the oldest point is removed when a new point exceeds that count. Complete retained state is currently sent in the workspace envelope and used by optimistic saves. Monitor workspace JSON size, row counts, request latency, lock waits, connection usage, storage, backup duration, and 409/413/422/503 rates. Audit diffs and recovery copies may dominate storage over time. Plan paginated history and smaller entity APIs before volume exceeds measured limits.
+Audit and saved forecast history are retained. Recovery points rotate at 30. Complete retained state is exchanged in the workspace envelope. Monitor JSON size, document/collection sizes, transaction duration/retries, connection/file-descriptor usage, backup duration and 409/413/422/503 rates. The development MongoDB container sets soft/hard `nofile` to 64,000 after stress testing exhausted the default 1,024; production MongoDB operators must set and monitor suitable limits separately from the application container. Audit diffs and recovery copies can dominate storage. Plan entity-level APIs and paginated history before large volumes.
 
-The default upload limit is 12 MiB; increasing it is a short-term operational choice within the supported maximum of 32 MiB, not a retention strategy. Do not truncate audit or frozen forecasts to bypass the limit. Agree on an explicit archival policy and implement/test it as a migration or supported API change.
+Uploads default to 12 MiB, configurable up to 32 MiB. Individual BSON documents remain limited to 16 MiB; forecast lines, recovery copies and large audit details are stored separately/chunked. Raising HTTP limits is not a retention strategy. Do not erase audit or frozen forecasts to work around limits; implement reviewed archival through supported APIs/schema changes.
 
 ## Secrets and access changes
 
-Rotate gateway and DB credentials through the platform secret store, coordinate gateway/app rollout, and verify access after rotation. Remove access through SSO group membership. All users within a role share the workspace; record-level business entity restrictions would require an application change. Changing a family’s business/funding ownership changes its projects’ current reporting ownership; immutable forecast names and captured records remain historical snapshots.
+Rotate gateway/MongoDB credentials through the secret store and verify after rollout. Remove application access through SSO groups. Database owner, runtime, backup and restore identities have separate purposes; runtime audit access remains find/insert only. Users share the workspace, so per-business-entity access would need an application change. Changing a family's ownership changes current projects' reporting ownership; frozen forecast labels remain historical.
+
+## Moving from PostgreSQL
+
+Keep the previous service and its backup available until a reviewed cutover succeeds. Export version-2 workspace JSON through its authenticated Recovery page; retain the original securely. Import the JSON into the empty MongoDB application as an administrator, compare planning totals, IDs, forecasts and recovery points, and validate roles before switching traffic. Existing client-import rules preserve server history and mark newly imported historical audit as legacy; a JSON transfer does not recreate the old database's authenticated audit provenance. Keep the old database backup for that record.
+
+Older demos without project families need the reviewed converter in [README.md](../README.md). SQL dumps and schema files are not accepted by MongoDB. This package neither connects to nor alters an existing PostgreSQL deployment automatically.

@@ -12,8 +12,6 @@ RUN pip install --no-cache-dir --require-hashes -r requirements.txt \
     && useradd --uid 10001 --gid tracker --no-create-home --shell /usr/sbin/nologin tracker
 
 COPY --chown=10001:10001 backend/app ./app
-COPY --chown=10001:10001 backend/alembic.ini ./alembic.ini
-COPY --chown=10001:10001 backend/migrations ./migrations
 COPY --chown=10001:10001 frontend /app/frontend
 
 USER 10001:10001

@@ -1,67 +1,72 @@
 # Repository audit
 
-Reviewed the frontend, Python API/domain/planners, relational persistence, migrations, conversion tools, container configuration, CI and hosting documentation against baseline commit `85d913aad2f4586573b3b31b7fe8c52c9edce914`. Fixes include targeted regression tests. Verification used synthetic data only.
+The application now targets MongoDB 8.0 with PyMongo. This document separates the current storage conversion from the earlier PostgreSQL audit. Synthetic data only is used for verification; existing demos, workbook records and browser storage are not moved automatically.
 
-## Findings corrected
+## MongoDB conversion
 
-### Shipment and allocation accounting
+- Live entities use separate MongoDB collections. ASIC variants/prices and project associations/transit settings are embedded in their owning records. Forecast lines remain separate; recovery copies and large audit details are checksummed chunks.
+- Replica-set transactions use snapshot reads, majority writes and a conditional workspace revision. Planning changes and the authenticated audit append commit together.
+- A versioned owner-run Python job creates schema version `20261030_0001`. The runtime account has narrowly scoped collection access and find/insert only on audit entries/chunks; it does not need owner privileges.
+- The API's version-2 JSON contract, family inheritance, permissions, allocation/shipment rules, planner results and frontend flows are retained. Dates and accepted historical metadata preserve their JSON representation.
+- PostgreSQL, SQLAlchemy, psycopg and Alembic are removed from the runtime/setup path. Configuration uses `MONGODB_URI`/`MONGODB_URI_FILE` and `MONGODB_DATABASE`. Existing SQL files and dumps are not loaded into MongoDB; authenticated workspace JSON export/import is the reviewed transition.
+- Hosting/operations instructions now require a replica set, separate database identities and a consistent backup boundary with traffic stopped.
 
-- Exact request event IDs now take precedence over colliding legacy aliases. Shared historical aliases retain FIFO behavior. Browser and API use matching creation-time and ID ordering across timezone offsets and missing historical timestamps.
-- An explicitly linked shipment larger than its request can close eligible dedicated allocation commitments without overstating request fulfillment or taking units credited to another request. Already shipped units remain the minimum allocation quantity.
-- New allocations cannot exclude arbitrary future shipments from their shipment baseline. Available inventory still does not create allocations automatically.
-- Editing shipment/request links retains the correct target. Editing allocation notes or quantity preserves the recorded arrival/transit values unless the dispatch date is explicitly changed.
+## Current MongoDB verification
 
-### Data preservation and imports
-
-- Unstructured legacy ASIC part metadata, part compatibility fields, archived master metadata, absent/zero legacy transit defaults and unused per-ASIC transit settings survive unrelated edits and database round trips.
-- Request edits preserve missing historical timestamps instead of inventing new FIFO priority. Recovery restores correctly handle absent source metadata and optional pending-request collections.
-- Reviewed project-family CSV mappings round-trip padded names and literal values. Spreadsheet formula prefixes are escaped reversibly. Malformed family data now produces an actionable conversion error.
-- Audit reasons are stripped, validated and retained up to the documented 200-character limit.
-
-### Validation and startup failures
-
-- Malformed Origin URLs, oversized numeric prices, nonfinite JSON values, invalid group claims and unsafe Unicode return controlled validation/authentication errors instead of server exceptions.
-- Indexed project keys and part MPNs are bounded by UTF-8 byte length before PostgreSQL writes. Invalid timezone offsets are rejected consistently.
-- Configured frontend directories must contain the HTML and referenced local JavaScript/CSS assets at startup. An explicitly API-only application remains supported.
-
-### Reports and date handling
-
-- Pacific-date behavior is consistent for quarter selection, backup names and date-only recovery records. Valid four-digit years no longer encounter the date picker's former 2040 cutoff.
-- Very long weekly reports retain the latest 5,300 weeks through the selected cutoff, include earlier demand/allocations in the opening balance and explain the window. CSV labels match that range.
-- Backup file reading supports the documented 32 MiB client limit while explaining the server's separate request-body limit.
-
-## Verification
-
-| Area | Evidence |
+| Check | Result |
 | --- | --- |
-| Backend | 289 tests passed with real PostgreSQL 17.11; no skips |
-| Frontend | 48 Node 22 tests passed, including actual event handlers and all 13 page renderers |
-| Compatibility | All 122 frozen legacy planner fixtures still pass |
-| Generated scenarios | 3,000 conservation/purity cases plus 1,600 exact browser/Python read-model comparisons passed |
-| Development container | Bootstrap/build/migration, served assets, onboarding, request coverage, explicit allocation, stale writes and restart persistence passed |
-| Production template | Real HTTP role/token checks, mounted secrets, non-root runtime, separate migration/runtime database identities passed |
-| Database restrictions | Eight prohibited operations denied, including audit tampering, persistent DDL and migration-table writes |
-| Recovery | PostgreSQL dump/restore retained the exact canonical state, frozen forecasts, recovery snapshots, price history, Unicode and audit records |
-| Dependencies | PyPA pip-audit reported no known vulnerabilities among 35 pinned runtime/test dependencies at audit time |
+| Native backend suite with real MongoDB 8.0.34 replica set | 325 passed, no skips |
+| Frontend suite | 48 passed, also verified on Linux/Node 22 |
+| Frozen planner fixtures | All 122 original synthetic fixtures passed |
+| Generated planner checks | 3,000 conservation/purity scenarios and 1,600 exact JS/Python read-model comparisons passed |
+| Dependency audit | 31 pinned Python runtime/test dependencies; zero known vulnerabilities reported at audit time |
+| Development Compose | Fresh bootstrap, authenticated MongoDB/schema setup, nonroot app, all 11 scripts/3 stylesheets, synthetic import, inherited ownership, stock/allocation totals, audit attribution and stale-write 409 passed |
+| Retained-volume restart | Exact canonical state, revision, audit and all four availability read models survived documented down/up |
+| Linux ARM64 backend | 325 passed, no skips |
+| Production Compose | UID 10001/read-only runtime with no owner secret; HTTP roles/security/planning, explicit allocation, stale writes and audit history passed |
+| Database recovery | Traffic-stopped 13-collection archive restored into a second authenticated replica set/new DB; all counts and exact canonical revision 6, audit, forecasts, recovery, parts/prices/Unicode and availability matched |
+| App recreation | No automatic planning writes after app recreation with `--no-deps` |
 
-The initial Alembic migration and relational models are unchanged, so these fixes require no new schema migration. The application remains a shared workspace with optimistic revision checks, family-inherited ownership, explicit allocation and append-only server audit. [API.md](API.md) and [README.md](../README.md) describe its validation and size limits.
+Actual container testing corrected three startup issues: a block-scoped mongosh helper lost access to its database binding and was changed to a lexical arrow function; a temporary shell home was provided on the read-only setup container; and keyfile initialization now replaces its own existing file before applying permissions, so down/up works after the file is owned by MongoDB. The keyfile keeps mode 0400 inside its dedicated volume without adding capabilities. Full-suite container stress also exposed the default MongoDB file-descriptor limit of 1,024; the database service now explicitly sets soft/hard `nofile` to 64,000, and the complete Linux suite subsequently passed.
 
-The deterministic planner checker is included in CI and can be run from the repository root after installing the test dependencies:
+MongoDB 8.0.34 passed on Ubuntu 24.04/kernel 6.8.0-142 and refused startup on the tested Ubuntu 26.04/kernel 7.0.0-34. This qualifies the tested image/kernel pair; it is not a blanket limit for later releases. See the [upstream issue](https://jira.mongodb.org/browse/SERVER-121912).
 
-```sh
-PYTHONPATH=backend .venv/bin/python -m pytest backend/tests -q
-node --test frontend/tests/*.test.cjs
-.venv/bin/python scripts/check_planners.py
-```
+Restore verification also caught a successful tool exit with zero documents when the tools URI contained `/admin`; the corrected URI omits its database path and the instructions require explicit count/state comparison.
 
-Set `TEST_DATABASE_URL` to a disposable PostgreSQL database to include all database tests. The planner checker accepts `--node /path/to/node` or `NODE_BINARY` and reports seeds and failing inputs if a scenario fails. Its default seeds are `20261029` for conservation and `20261030` for parity.
+Current conversion evidence is recorded in [VERIFICATION.md](VERIFICATION.md). Historical counts below do not establish MongoDB correctness.
 
-## Remaining integration checks
+## Historical PostgreSQL audit
 
-- A fresh interactive browser layout/accessibility pass was initially blocked by the locked Mac. After unlock, the browser permission control denied access to the local test app. Automated source/handler rendering and live HTTP asset checks passed. Earlier browser workflow checks are recorded in [VERIFICATION.md](VERIFICATION.md).
-- Local container checks ran on Linux ARM64. Hosted GitHub Actions status and Linux x86-64 behavior were not independently verified.
-- The hosting team must connect and test Cisco SSO, internal ingress/TLS/DNS, the production secret store and database operations, image scanning and production backup/restore procedures. Local proxy authentication and PostgreSQL restore have been exercised.
-- The shared-workspace API is intended for a small internal team. Entity-level endpoints, pagination and load testing should precede high concurrency or large history volumes. Current limits are explicit in the README.
-- One upstream Starlette/httpx test-client deprecation warning remains; it is not a test failure. The dependency audit covers known Python vulnerabilities, not operating-system image vulnerabilities or future advisories.
+The previous audit used baseline commit `85d913aad2f4586573b3b31b7fe8c52c9edce914`. It corrected the following application behaviors before this storage conversion:
 
-No finite audit can guarantee the absence of defects. These results establish the checked behaviors and make the remaining deployment and visual checks explicit.
+- Exact request IDs take precedence over legacy aliases. FIFO creation-time and ID ordering agree across browser/API, including timezone offsets and missing timestamps.
+- Explicit surplus shipments can close eligible dedicated allocations without overstating requests or stealing credited units. Baselines protect new allocations from historical shipments.
+- Shipment/request links, allocation schedules, archived master metadata, part compatibility fields, legacy transit defaults and unused transit settings survive unrelated edits.
+- Reviewed family mapping CSV preserves literal/padded values and safely handles spreadsheet formula prefixes. Malformed data produces controlled errors.
+- Malformed origins, nonfinite/huge prices, unsafe Unicode and invalid group claims are rejected. Startup checks frontend assets.
+- Pacific dates, early years, bounded weekly reports, numeric tooltips, CSV exports and backup-reader limits have regression coverage.
+
+Historical verification at that PostgreSQL revision:
+
+| Area | Historical evidence — not a MongoDB result |
+| --- | --- |
+| Backend | 289 passed against PostgreSQL 17.11, no skips |
+| Frontend | 48 Node 22 tests passed, including handlers and 13 page renderers |
+| Frozen planner fixtures | All 122 original synthetic fixtures passed |
+| Generated planners | 3,000 conservation/purity cases and 1,600 exact JS/Python read-model comparisons passed |
+| Containers | Development startup/restart and production proxy-secret/role checks passed |
+| Database restrictions | Eight PostgreSQL prohibited operations denied |
+| Recovery | PostgreSQL dump/restore retained canonical state, forecasts, snapshots, prices, Unicode and audit |
+| Dependency audit | No known vulnerabilities reported among 35 pinned dependencies at that time |
+
+The old Alembic/SQL commands are no longer active setup instructions. Current MongoDB evidence is listed above; historical database/grant/restore results and the old dependency audit do not verify the new storage stack.
+
+## Reproducible checks and rollout limits
+
+Use the current test commands and disposable MongoDB replica-set configuration in [README.md](../README.md). `scripts/check_planners.py` checks conservation and browser/API parity with reported seeds; `--node /path/to/node` or `NODE_BINARY` selects Node.
+
+The hosting team must verify Cisco SSO, ingress/TLS/DNS, its secret store, image scans, production restore procedure and expected load. Local Linux ARM64 evidence does not establish Linux x86-64 or hosted GitHub Actions results. The complete-workspace API is intended for a small team; larger history/concurrency needs paginated history, entity APIs and measured load tests.
+
+The previous fresh visual pass was blocked first by the locked Mac and then by a browser permission denial. Automated renderer/handler and HTTP asset checks are useful, but do not replace a current layout/accessibility review. No additional browser attempt is implied by this conversion.
+
+No finite audit guarantees an absence of defects. [VERIFICATION.md](VERIFICATION.md) lists what was actually checked and the remaining integration work.
