@@ -57,7 +57,7 @@
     }
     const projectId=old?.projectId||c.ui.requestProjectId||'',asicId=old?.asicId||c.ui.requestAsicId||'';
     const project=c.lookupP(projectId);
-    const shipDays=old?.shipDays??project?.leadTimes?.[asicId]??project?.leadDays??7;
+    const shipDays=old?.shipDays??project?.leadTimes?.[asicId]??project?.leadDays??0;
     const shipBy=old?c.T.requestShipBy(old):c.referenceDate();
     const draft={...old,id:old?.id||'request-preview',type:'request',projectId,asicId,qty:old?.qty||0,shipDays,requestedShipDate:shipBy,date:old?.date||shipBy};
     const {esc,field,selectField,openDrawer}=c;

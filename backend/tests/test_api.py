@@ -1,4 +1,5 @@
 from copy import deepcopy
+import json
 
 import pytest
 from fastapi.testclient import TestClient
@@ -132,6 +133,59 @@ def test_cross_origin_writes_and_oversized_bodies_rejected(api):
     assert client.get("/api/workspace").json()["revision"] == 0
 
 
+@pytest.mark.parametrize("origin", ["http://[", "https://[::1"])
+def test_malformed_origin_is_rejected_without_server_error(api, origin):
+    app, client = api
+    response = client.put("/api/workspace", json={"revision": 0, "state": empty_state()}, headers={"Origin": origin})
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "cross_origin_write"
+    assert client.get("/api/workspace").json()["revision"] == 0
+
+
+@pytest.mark.parametrize("invalid", [10**500, "NUL\x00name", "invalid\ud800name"])
+def test_unstorable_client_values_return_validation_error_and_preserve_state(api, workspace, invalid):
+    app, client = api
+    first = put(client, workspace).json()
+    changed = deepcopy(first["state"])
+    changed["asics"][0]["price" if isinstance(invalid, int) else "name"] = invalid
+    # ensure_ascii exposes the same escaped-Unicode JSON a browser/API client can
+    # send, instead of failing inside this test client's own UTF-8 serializer.
+    response = client.put("/api/workspace", content=json.dumps({"revision": first["revision"], "state": changed}).encode(), headers={"Content-Type": "application/json"})
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "invalid_workspace"
+    assert client.get("/api/workspace").json() == first
+
+
+@pytest.mark.parametrize("reason", ["   ", "\t\n", "bad\x00reason", "bad\ud800reason"])
+def test_invalid_operation_reason_cannot_poison_the_server_audit(api, workspace, reason):
+    app, client = api
+    response = client.put("/api/workspace", content=json.dumps({"revision": 0, "state": workspace, "reason": reason}).encode(), headers={"Content-Type": "application/json"})
+    assert response.status_code == 422
+    assert client.get("/api/workspace").json()["revision"] == 0
+
+
+def test_operation_reason_is_trimmed_before_length_and_audit_storage(api, workspace):
+    app, client = api
+    response = client.put("/api/workspace", json={"revision": 0, "state": workspace, "reason": " " * 170 + "A valid change"})
+    assert response.status_code == 200, response.text
+    saved = response.json()
+    assert saved["state"]["audit"][-1]["action"] == "A valid change"
+    # A malformed server-generated audit action previously prevented every
+    # subsequent ordinary save; explicitly verify this workspace remains usable.
+    assert put(client, saved["state"], revision=saved["revision"]).status_code == 200
+
+
+@pytest.mark.parametrize("invalid", [{"revision": float("nan")}, {"revision": float("inf")}, {"unexpected": {"secret": "bad\ud800text"}}, {"bad\ud800key": "extra"}])
+def test_invalid_envelope_values_cannot_break_validation_error_serialization(api, invalid):
+    app, client = api
+    body = {"revision": 0, "state": empty_state(), **invalid}
+    response = client.put("/api/workspace", content=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    assert response.status_code == 422
+    errors = response.json()["detail"]
+    assert errors and all("msg" in error and "loc" in error and "input" not in error for error in errors)
+    assert client.get("/api/workspace").json()["revision"] == 0
+
+
 def test_chunked_body_limit_is_enforced_without_content_length():
     app = create_app(Settings(database_url="sqlite+pysqlite://", auth_mode="development", frontend_dir=None, require_migrations=False, max_body_bytes=1024))
     Base.metadata.create_all(app.state.engine)
@@ -152,6 +206,19 @@ def test_proxy_authentication_requires_gateway_secret_and_assigned_group():
         assert result.status_code == 200
         assert result.json()["role"] == "editor"
         assert client.get("/health/live").status_code == 200
+
+
+def test_proxy_json_group_claim_accepts_whitespace_and_rejects_parser_limits():
+    app = create_app(Settings(database_url="sqlite+pysqlite://", auth_mode="proxy", proxy_shared_secret="s" * 32, frontend_dir=None, require_migrations=False))
+    Base.metadata.create_all(app.state.engine)
+    trusted = {"X-Proxy-Token": "s" * 32, "X-Authenticated-User": "authenticated-subject"}
+    with TestClient(app) as client:
+        result = client.get("/api/me", headers={**trusted, "X-Authenticated-Groups": '  ["asic-tracker-viewers"] '})
+        assert result.status_code == 200 and result.json()["role"] == "viewer"
+        for malformed in ("[" + "1" * 5000 + "]", "[" * 4000 + "]" * 4000):
+            result = client.get("/api/me", headers={**trusted, "X-Authenticated-Groups": malformed})
+            assert result.status_code == 403
+            assert result.json()["detail"]["code"] == "invalid_groups"
 
 
 def test_missing_proxy_secret_fails_closed_at_startup():
@@ -207,3 +274,35 @@ def test_readiness_rejects_stale_migration_revision():
         with app.state.engine.begin() as connection:
             connection.execute(text("UPDATE alembic_version SET version_num = '20261029_0001'"))
         assert client.get("/health/ready").status_code == 200
+
+
+@pytest.mark.parametrize("missing", ["directory", "index", "script", "stylesheet"])
+def test_missing_configured_frontend_fails_startup(tmp_path, missing):
+    frontend = tmp_path / "frontend"
+    if missing != "directory":
+        frontend.mkdir()
+    if missing not in {"directory", "index"}:
+        (frontend / "index.html").write_text('<script src="app.js"></script><link rel="stylesheet" href="styles.css">')
+        if missing != "script":
+            (frontend / "app.js").write_text("/* app */")
+        if missing != "stylesheet":
+            (frontend / "styles.css").write_text("body {}")
+    app = create_app(Settings(database_url="sqlite+pysqlite://", auth_mode="development", frontend_dir=frontend, require_migrations=False))
+    with pytest.raises(ValueError, match="FRONTEND_DIR"):
+        with TestClient(app):
+            pass
+
+
+def test_complete_frontend_and_api_only_configuration_still_start(tmp_path):
+    (tmp_path / "index.html").write_text('<script src="app.js?v=1"></script><link rel="stylesheet" href="styles.css">')
+    (tmp_path / "app.js").write_text("/* app */")
+    (tmp_path / "styles.css").write_text("body {}")
+    app = create_app(Settings(database_url="sqlite+pysqlite://", auth_mode="development", frontend_dir=tmp_path, require_migrations=False))
+    with TestClient(app) as client:
+        assert client.get("/").status_code == 200
+        assert client.get("/app.js?v=1").status_code == 200
+        assert client.get("/health/live").status_code == 200
+    app = create_app(Settings(database_url="sqlite+pysqlite://", auth_mode="development", frontend_dir=None, require_migrations=False))
+    with TestClient(app) as client:
+        assert client.get("/health/live").status_code == 200
+        assert client.get("/").status_code == 404

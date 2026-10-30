@@ -23,7 +23,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.models import (
     ASIC, ASICPart, AuditEntry, Base, ForecastLine, PlanningEvent,
-    ProjectASIC, WorkspaceMeta,
+    Project, ProjectASIC, WorkspaceMeta,
 )
 from app.repository import RevisionConflict, empty_state, get_workspace, write_workspace
 
@@ -137,6 +137,55 @@ def test_relational_roundtrip_retains_parts_prices_dates_and_legacy_metadata(db_
         assert session.get(PlanningEvent, "allocation-1").canonical_request_id == "request-1"
         assert "asics" not in session.get(WorkspaceMeta, 1).extra
         assert "projects" not in session.get(WorkspaceMeta, 1).extra
+        assert "leadTimes" not in session.get(Project, "project-1").extra
+
+
+def test_legacy_flat_part_metadata_survives_import_without_invented_variants(db_engine):
+    from app.domain import validate_workspace
+
+    state = sample_state()
+    state["asics"][0].pop("parts")
+    expected = {"mpns": ["Legacy-MPN-A", "Legacy-MPN-B"], "cpns": ["Legacy-CPN"],
+                "plid": "Legacy PLID", "assembly": "Legacy assembly", "subtype": "Legacy subtype"}
+    state["asics"][0].update(expected)
+    first = save(db_engine, validate_workspace(state))["state"]
+    assert first["asics"][0]["parts"] == []
+    assert {field: first["asics"][0][field] for field in expected} == expected
+    second = save(db_engine, first, revision=1)["state"]
+    assert {field: second["asics"][0][field] for field in expected} == expected
+    with Session(db_engine) as session:
+        assert session.scalar(select(func.count()).select_from(ASICPart)) == 0
+
+
+@pytest.mark.parametrize("default_transit", [None, "absent"])
+def test_unspecified_project_transit_preserves_legacy_allocation_ship_date(db_engine, default_transit):
+    from app.domain import validate_workspace
+    from app.planning import allocation_plan
+
+    state = sample_state()
+    state["projects"][0]["leadTimes"] = {}
+    if default_transit == "absent":
+        state["projects"][0].pop("leadDays")
+    else:
+        state["projects"][0]["leadDays"] = default_transit
+    next(event for event in state["events"] if event["type"] == "expected_fulfilment").pop("availableShipDate")
+    state = validate_workspace(state)
+    before = allocation_plan(state, "2026-10-29")["allocations"][0]["shipBy"]
+    result = save(db_engine, state)["state"]
+    assert before == "2026-11-04"
+    assert allocation_plan(result, "2026-10-29")["allocations"][0]["shipBy"] == before
+    assert result["projects"][0]["leadTimes"] == {"asic-1": 0}
+
+
+def test_accepted_transit_configuration_for_unassociated_asic_is_not_dropped(db_engine):
+    from app.domain import validate_workspace
+
+    state = sample_state()
+    state["events"] = []
+    state["projects"][0].update(asicIds=[], leadTimes={"asic-1": 9})
+    result = save(db_engine, validate_workspace(state))["state"]
+    assert result["projects"][0]["asicIds"] == []
+    assert result["projects"][0]["leadTimes"] == {"asic-1": 9}
 
 
 def test_stale_revision_cannot_overwrite_or_create_an_audit(db_engine):
@@ -298,6 +347,22 @@ def test_audit_diff_contains_before_after_event_quantities(db_engine):
     event = next(change for change in detail["changes"] if change["id"] == "allocation-1")
     assert event["before"]["qty"] == 8 and event["after"]["qty"] == 9
     assert audit["actor"] == "test-editor" and audit["action"] == "Change allocation"
+
+
+@pytest.mark.parametrize("reason,expected", [(" \t ", "Update workspace"), (" " * 200 + "Meaningful action", "Meaningful action")])
+def test_server_audit_action_is_nonblank_even_for_internal_whitespace_reason(db_engine, reason, expected):
+    from app.domain import validate_workspace
+
+    result = save(db_engine, sample_state(), reason=reason)["state"]
+    assert result["audit"][-1]["action"] == expected
+    assert validate_workspace(result)["audit"][-1]["action"] == expected
+
+
+def test_audit_retains_full_200_character_accepted_reason(db_engine):
+    reason = "A" * 180 + "Z" * 20
+    result = save(db_engine, sample_state(), reason=reason)["state"]
+    assert result["audit"][-1]["action"] == reason
+    assert load(db_engine)["state"]["audit"][-1]["action"] == reason
 
 
 def test_frozen_migration_roundtrip_does_not_load_application_auth(tmp_path, monkeypatch):

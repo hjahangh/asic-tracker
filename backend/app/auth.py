@@ -37,9 +37,10 @@ def actor_for_request(request: Request) -> Actor:
     raw_groups = request.headers.get("X-Authenticated-Groups", "")
     if len(raw_groups) > 8192:
         raise HTTPException(403, detail={"code": "invalid_groups", "message": "The gateway group claim is invalid."})
+    raw_groups = raw_groups.strip()
     try:
         groups = json.loads(raw_groups) if raw_groups.startswith("[") else [group.strip() for group in raw_groups.split(",") if group.strip()]
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         groups = None
     if not isinstance(groups, list) or any(not isinstance(group, str) for group in groups):
         raise HTTPException(403, detail={"code": "invalid_groups", "message": "The gateway group claim is invalid."})

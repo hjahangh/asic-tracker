@@ -7,7 +7,7 @@ Unbacked allocation promises remain visible; they do not manufacture inventory.
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 PACIFIC = ZoneInfo("America/Los_Angeles")
@@ -32,6 +32,19 @@ def creation_date(value: str | None) -> str:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(PACIFIC).date().isoformat()
 
 
+def creation_priority(value: str | None) -> tuple[str, int, str]:
+    """Order actual instants consistently with browser millisecond precision.
+
+    Undated imports remain oldest. A calendar-only legacy creation value denotes
+    its recorded Pacific day with unknown time, before known instants that day.
+    """
+    day = creation_date(value)
+    if not value or valid_date(value):
+        return day, 0, ""
+    instant = datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    return day, 1, instant.isoformat(timespec="milliseconds")
+
+
 def request_ship_by(event: dict) -> str:
     if valid_date(event.get("requestedShipDate")):
         return event["requestedShipDate"]
@@ -46,11 +59,26 @@ def allocation_ship_by(state: dict, event: dict) -> str:
     return (date.fromisoformat(event["date"]) - timedelta(days=days)).isoformat()
 
 
+def matching_requests(requests: list[dict], reference: str, asic_id: str, project_id: str,
+                      *, identifier_key: str = "eventId") -> list[dict]:
+    """Resolve within one ASIC/project; a real event ID always beats an alias.
+
+    Caller ordering retains legacy FIFO behavior for nonunique imported aliases.
+    The repository records a canonical FK only when the reference is unambiguous.
+    """
+    if not reference:
+        return []
+    matches = [row for row in requests if row["asicId"] == asic_id and row["projectId"] == project_id
+               and reference in (row[identifier_key], row.get("requestId"))]
+    exact = [row for row in matches if row[identifier_key] == reference]
+    return exact or matches
+
+
 def allocation_plan(state: dict, as_of: str | None = None) -> dict:
     as_of = as_of or today_pacific()
     if not valid_date(as_of):
         raise ValueError("Availability needs a valid as-of date.")
-    order = lambda row: (row["shipBy"], row["createdAt"], row["eventId"])
+    order = lambda row: (row["shipBy"], creation_priority(row["createdAt"]), row["eventId"])
     requests = sorted(({
         "eventId": e["id"], "requestId": e.get("requestId") or e["id"],
         "asicId": e["asicId"], "projectId": e["projectId"], "qty": e["qty"],
@@ -62,9 +90,8 @@ def allocation_plan(state: dict, as_of: str | None = None) -> dict:
     } for e in state["events"] if e["type"] == "request"), key=order)
     allocations = []
     for event in (e for e in state["events"] if e["type"] == "expected_fulfilment"):
-        request = next((r for r in requests if event.get("requestId")
-            and r["asicId"] == event["asicId"] and r["projectId"] == event["projectId"]
-            and event["requestId"] in (r["eventId"], r["requestId"])), None)
+        matches = matching_requests(requests, event.get("requestId", ""), event["asicId"], event["projectId"])
+        request = matches[0] if matches else None
         allocations.append({
             "eventId": event["id"], "requestId": event.get("requestId", ""),
             "asicId": event["asicId"], "projectId": event["projectId"], "qty": event["qty"],
@@ -77,16 +104,16 @@ def allocation_plan(state: dict, as_of: str | None = None) -> dict:
     request_created = {r["eventId"]: creation_date(r["createdAt"]) for r in requests}
     allocation_created = {r["eventId"]: creation_date(r["createdAt"]) for r in allocations}
     baselines = {e["id"]: set(e.get("priorShipmentIds", [])) for e in state["events"] if e["type"] == "expected_fulfilment"}
-    credit_allocations = sorted(allocations, key=lambda r: (r["createdAt"], r["eventId"]))
+    credit_allocations = sorted(allocations, key=lambda r: (creation_priority(r["createdAt"]), r["eventId"]))
     shipments = sorted((e for e in state["events"] if e["type"] == "actual_ship" and e["date"] <= as_of),
         key=lambda e: (e["date"], e["id"]))
     completed = [e for e in shipments if e.get("requestId")] + [e for e in shipments if not e.get("requestId")]
     shipment_credits = {}
     for shipment in completed:
         uncredited, credits = shipment["qty"], []
-        candidates = [r for r in requests if r["asicId"] == shipment["asicId"] and r["projectId"] == shipment["projectId"]
-            and (shipment["requestId"] in (r["requestId"], r["eventId"]) if shipment.get("requestId")
-                 else request_created[r["eventId"]] <= shipment["date"])]
+        candidates = matching_requests(requests, shipment["requestId"], shipment["asicId"], shipment["projectId"]) if shipment.get("requestId") else [
+            row for row in requests if row["asicId"] == shipment["asicId"] and row["projectId"] == shipment["projectId"]
+            and request_created[row["eventId"]] <= shipment["date"]]
         for row in candidates:
             quantity = min(uncredited, row["remainingQty"])
             if not quantity:
@@ -116,6 +143,25 @@ def allocation_plan(state: dict, as_of: str | None = None) -> dict:
                 uncredited -= quantity
                 remaining -= quantity
                 if not remaining:
+                    break
+        # A dedicated promise can exceed its request. Explicit dispatches that
+        # exceed still-open demand satisfy that promise too, without reusing
+        # units already credited to another request under a shared legacy alias.
+        surplus = shipment["qty"] - sum(credit["qty"] for credit in shipment_credits[shipment["id"]])
+        if shipment.get("requestId") and surplus:
+            targets = {row["eventId"] for row in matching_requests(
+                requests, shipment["requestId"], shipment["asicId"], shipment["projectId"])}
+            for allocation in credit_allocations:
+                if not (allocation["asicId"] == shipment["asicId"] and allocation["projectId"] == shipment["projectId"]
+                    and allocation["boundRequestId"] in targets
+                    and shipment["id"] not in baselines[allocation["eventId"]]):
+                    continue
+                quantity = min(surplus, uncredited, allocation["remainingQty"])
+                allocation["shippedQty"] += quantity
+                allocation["remainingQty"] -= quantity
+                uncredited -= quantity
+                surplus -= quantity
+                if not surplus:
                     break
         for allocation in credit_allocations:
             if not (allocation["asicId"] == shipment["asicId"] and allocation["projectId"] == shipment["projectId"]

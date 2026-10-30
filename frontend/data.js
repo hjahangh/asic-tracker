@@ -2,6 +2,8 @@
 (function () {
   'use strict';
   const VERSION = 2;
+  const MAX_WEEK_ROWS = 5300;
+  const compareIds=(a,b)=>a<b?-1:a>b?1:0;
   function todayPacific() {
     const parts=new Intl.DateTimeFormat('en-US',{timeZone:'America/Los_Angeles',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());
     const p=Object.fromEntries(parts.map(x=>[x.type,x.value])); return p.year+'-'+p.month+'-'+p.day;
@@ -13,7 +15,7 @@
   const clone = value => JSON.parse(JSON.stringify(value));
   const dateOf = date => new Date(date + 'T12:00:00Z');
   const stamp = date => date.toISOString().slice(0, 10);
-  const isDate = date => typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date) && Number.isFinite(+dateOf(date)) && stamp(dateOf(date)) === date;
+  const isDate = date => typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date) && date.slice(0,4)!=='0000' && Number.isFinite(+dateOf(date)) && stamp(dateOf(date)) === date;
   function monday(date) {
     const d = dateOf(date); if (!Number.isFinite(+d)) return '';
     d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
@@ -23,10 +25,10 @@
     const d = dateOf(date); if (!Number.isFinite(+d)) return '';
     d.setUTCDate(d.getUTCDate() + 3 - ((d.getUTCDay() + 6) % 7));
     const year = d.getUTCFullYear();
-    const jan4 = new Date(Date.UTC(year, 0, 4, 12));
+    const jan4 = new Date(0); jan4.setUTCHours(12,0,0,0); jan4.setUTCFullYear(year,0,4);
     const firstThursday = new Date(jan4); firstThursday.setUTCDate(jan4.getUTCDate() + 3 - ((jan4.getUTCDay() + 6) % 7));
     const week = Math.round((d - firstThursday) / 604800000) + 1;
-    return `${year}-W${String(week).padStart(2, '0')}`;
+    return `${String(year).padStart(4,'0')}-W${String(week).padStart(2, '0')}`;
   }
   function quarterOf(date) { return `${date.slice(0, 4)}-Q${Math.ceil(Number(date.slice(5, 7)) / 3)}`; }
   function requestShipBy(event) {
@@ -49,27 +51,46 @@
     if (!createdAt||isDate(createdAt)) return createdAt||'';
     const parts=new Intl.DateTimeFormat('en-US',{timeZone:'America/Los_Angeles',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date(createdAt));
     const values=Object.fromEntries(parts.map(p=>[p.type,p.value]));
-    return values.year+'-'+values.month+'-'+values.day;
+    return String(values.year).padStart(4,'0')+'-'+values.month+'-'+values.day;
+  }
+  function creationPriority(value){
+    if(!value)return ['',0,''];
+    if(isDate(value))return [value,0,''];
+    return [creationDate(value),1,new Date(value).toISOString()];
+  }
+  const compareCreationKeys=(a,b)=>a[0].localeCompare(b[0])||a[1]-b[1]||a[2].localeCompare(b[2]);
+  function referenceMatches(rows,reference){
+    if(!reference)return [];
+    const exact=rows.filter(row=>(row.eventId||row.id)===reference);
+    return exact.length?exact:rows.filter(row=>row.requestId===reference);
+  }
+  function resolveRequest(state,event){
+    const requests=(state.events||[]).filter(row=>row.type==='request'&&row.asicId===event.asicId&&row.projectId===event.projectId)
+      .sort((a,b)=>requestShipBy(a).localeCompare(requestShipBy(b))||compareCreationKeys(creationPriority(a.createdAt),creationPriority(b.createdAt))||compareIds(a.id,b.id));
+    return referenceMatches(requests,event.requestId)[0];
   }
   function allocationPlan(state,{asOf=todayPacific()}={}) {
     if (!isDate(asOf)) throw new Error('Availability needs a valid as-of date.');
-    const order=(a,b)=>a.shipBy.localeCompare(b.shipBy)||String(a.createdAt||'').localeCompare(String(b.createdAt||''))||a.eventId.localeCompare(b.eventId);
+    const createdKeys=new Map(state.events.map(event=>[event.createdAt||'',creationPriority(event.createdAt)]));
+    const compareCreated=(a,b)=>compareCreationKeys(createdKeys.get(a.createdAt||''),createdKeys.get(b.createdAt||''));
+    const order=(a,b)=>a.shipBy.localeCompare(b.shipBy)||compareCreated(a,b)||compareIds(a.eventId,b.eventId);
     const requests=state.events.filter(e=>e.type==='request').map(e=>({eventId:e.id,requestId:e.requestId||e.id,asicId:e.asicId,projectId:e.projectId,qty:e.qty,shipBy:requestShipBy(e),arrivalDate:e.date,createdAt:e.createdAt||'',shippedQty:0,shippedByShipBy:0,lastShippedDate:null,remainingQty:e.qty,availableByShipBy:0,shortfallQty:e.qty,expectedAvailableDate:null,status:'shortfall',allocatedQty:0,allocatedAvailableByShipBy:0})).sort(order);
     const allocations=state.events.filter(e=>e.type==='expected_fulfilment').map(e=>{
-      const request=e.requestId?requests.find(r=>r.asicId===e.asicId&&r.projectId===e.projectId&&(r.eventId===e.requestId||r.requestId===e.requestId)):null;
+      const request=referenceMatches(requests.filter(r=>r.asicId===e.asicId&&r.projectId===e.projectId),e.requestId)[0];
       return {eventId:e.id,requestId:e.requestId||'',asicId:e.asicId,projectId:e.projectId,qty:e.qty,shipBy:allocationShipBy(state,e),arrivalDate:e.date,createdAt:e.createdAt||'',shippedQty:0,remainingQty:e.qty,reservedSupplyQty:0,unbackedQty:e.qty,boundRequestId:request?.eventId||'',lots:[]};
     }).sort(order);
     const requestCreated=new Map(requests.map(r=>[r.eventId,creationDate(r.createdAt)]));
     const allocationCreated=new Map(allocations.map(r=>[r.eventId,creationDate(r.createdAt)]));
     const allocationBaselines=new Map(state.events.filter(e=>e.type==='expected_fulfilment').map(e=>[e.id,new Set(e.priorShipmentIds||[])]));
     // Completed units keep their creation order even when future availability dates change.
-    const creditAllocations=allocations.slice().sort((a,b)=>String(a.createdAt||'').localeCompare(String(b.createdAt||''))||a.eventId.localeCompare(b.eventId));
+    const creditAllocations=allocations.slice().sort((a,b)=>compareCreated(a,b)||compareIds(a.eventId,b.eventId));
     // Only completed shipments consume stock. Explicit links are credited before general project FIFO.
-    const shipments=state.events.filter(e=>e.type==='actual_ship'&&e.date<=asOf).slice().sort((a,b)=>a.date.localeCompare(b.date)||a.id.localeCompare(b.id));
+    const shipments=state.events.filter(e=>e.type==='actual_ship'&&e.date<=asOf).slice().sort((a,b)=>a.date.localeCompare(b.date)||compareIds(a.id,b.id));
     const shipmentCredits=new Map();
     const creditRequestShipment=shipment=>{
       let uncredited=shipment.qty;const credits=[];
-      const candidates=requests.filter(r=>r.asicId===shipment.asicId&&r.projectId===shipment.projectId&&(shipment.requestId?(r.requestId===shipment.requestId||r.eventId===shipment.requestId):requestCreated.get(r.eventId)<=shipment.date));
+      const scoped=requests.filter(r=>r.asicId===shipment.asicId&&r.projectId===shipment.projectId);
+      const candidates=shipment.requestId?referenceMatches(scoped,shipment.requestId):scoped.filter(r=>requestCreated.get(r.eventId)<=shipment.date);
       for (const row of candidates) {
         const quantity=Math.min(uncredited,row.remainingQty);if (!quantity) continue;
         row.shippedQty+=quantity;row.remainingQty-=quantity;uncredited-=quantity;
@@ -94,6 +115,15 @@
           if (!remainingCredit) break;
         }
       }
+      if(shipment.requestId){
+        const matched=new Set(referenceMatches(requests.filter(r=>r.asicId===shipment.asicId&&r.projectId===shipment.projectId),shipment.requestId).map(r=>r.eventId));
+        let surplus=shipment.qty-(shipmentCredits.get(shipment.id)||[]).reduce((sum,credit)=>sum+credit.qty,0);
+        for(const allocation of creditAllocations.filter(a=>a.asicId===shipment.asicId&&a.projectId===shipment.projectId&&matched.has(a.boundRequestId)&&!allocationBaselines.get(a.eventId).has(shipment.id))){
+          const quantity=Math.min(surplus,uncredited,allocation.remainingQty);if(!quantity)continue;
+          allocation.shippedQty+=quantity;allocation.remainingQty-=quantity;uncredited-=quantity;surplus-=quantity;
+          if(!surplus||!uncredited)break;
+        }
+      }
       const general=creditAllocations.filter(a=>a.asicId===shipment.asicId&&a.projectId===shipment.projectId&&!a.boundRequestId&&!allocationBaselines.get(a.eventId).has(shipment.id)&&allocationCreated.get(a.eventId)<=shipment.date);
       for (const allocation of general) {
         const quantity=Math.min(uncredited,allocation.remainingQty);if (!quantity) continue;
@@ -101,14 +131,14 @@
         if (!uncredited) break;
       }
     }
-    const supply=state.events.filter(e=>e.type==='expected_ship').slice().sort((a,b)=>a.date.localeCompare(b.date)||a.id.localeCompare(b.id)).map(e=>({eventId:e.id,asicId:e.asicId,qty:e.qty,date:e.date,status:e.supplyStatus==='incoming'?'incoming':e.date<=asOf?'available':'incoming',overdue:e.supplyStatus==='incoming'&&e.date<asOf,consumedQty:0,onHandQty:0,reservedQty:0,freeQty:0,reference:e.supplyReference||'',note:e.note||''}));
+    const supply=state.events.filter(e=>e.type==='expected_ship').slice().sort((a,b)=>a.date.localeCompare(b.date)||compareIds(a.id,b.id)).map(e=>({eventId:e.id,asicId:e.asicId,qty:e.qty,date:e.date,status:e.supplyStatus==='incoming'?'incoming':e.date<=asOf?'available':'incoming',overdue:e.supplyStatus==='incoming'&&e.date<asOf,consumedQty:0,onHandQty:0,reservedQty:0,freeQty:0,reference:e.supplyReference||'',note:e.note||''}));
     const supplyById=new Map(supply.map(row=>[row.eventId,row])),pools=new Map();
     // Explicit overdue incoming lots remain unconfirmed and cannot establish a known readiness date.
     supply.filter(row=>!row.overdue).forEach(row=>{
       if (!pools.has(row.asicId)) pools.set(row.asicId,[]);
       pools.get(row.asicId).push({eventId:row.eventId,sourceDate:row.date,date:row.date<asOf?asOf:row.date,qty:row.qty,onHand:row.status==='available'&&row.date<=asOf});
     });
-    pools.forEach(pool=>pool.sort((a,b)=>a.date.localeCompare(b.date)||Number(b.onHand)-Number(a.onHand)||a.sourceDate.localeCompare(b.sourceDate)||a.eventId.localeCompare(b.eventId)));
+    pools.forEach(pool=>pool.sort((a,b)=>a.date.localeCompare(b.date)||Number(b.onHand)-Number(a.onHand)||a.sourceDate.localeCompare(b.sourceDate)||compareIds(a.eventId,b.eventId)));
     const shippedByAsic=new Map();shipments.forEach(e=>shippedByAsic.set(e.asicId,(shippedByAsic.get(e.asicId)||0)+e.qty));
     for (const [asicId,pool] of pools) {
       let consumed=shippedByAsic.get(asicId)||0;
@@ -226,9 +256,11 @@
     const cutoff = filters.cutoff || todayPacific();
     const matching = state.events.filter(e => matchesEvent(state, e, {...filters, cutoff}));
     if (!matching.length && !filters.start) return [];
-    const start = monday(filters.start || matching.map(e => e.date).sort()[0]);
+    const requestedStart = monday(filters.start || matching.map(e => e.date).sort()[0]);
     const end = monday(cutoff);
-    if (!start || !end || start > end) return [];
+    if (!requestedStart || !end || requestedStart > end) return [];
+    const endTime=+dateOf(end),earliest=endTime-(MAX_WEEK_ROWS-1)*604800000;
+    const truncated=+dateOf(requestedStart)<earliest,start=truncated?stamp(new Date(earliest)):requestedStart;
     const measures = {request:'demand',expected_fulfilment:'allocation',expected_ship:'supply',actual_ship:'shipped',actual_fulfilment:'fulfilled'};
     let balance = 0; const buckets = new Map();
     matching.forEach(e => {
@@ -237,13 +269,14 @@
       if (!buckets.has(week)) buckets.set(week,{demand:0,allocation:0,supply:0,shipped:0,fulfilled:0});
       const measure = measures[e.type]; if (measure) buckets.get(week)[measure] += e.qty;
     });
-    const rows = [];
-    for (let day = dateOf(start), count = 0; stamp(day) <= end && count < 5300; day.setUTCDate(day.getUTCDate() + 7), count++) {
+    const rows = [],openingBalance=balance;
+    for (let day = dateOf(start), count = 0; +day <= endTime && count < MAX_WEEK_ROWS; day.setUTCDate(day.getUTCDate() + 7), count++) {
       const week = stamp(day);
       const weekStats = buckets.get(week) || {demand:0,allocation:0,supply:0,shipped:0,fulfilled:0};
       balance += weekStats.allocation - weekStats.demand;
       rows.push({week,label:day.toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'UTC'}),...weekStats,balance});
     }
+    if(truncated){rows.notice=`Showing the latest ${MAX_WEEK_ROWS.toLocaleString('en-US')} weeks from ${start}. Earlier demand and allocations are included in the opening balance.`;rows.openingBalance=openingBalance;}
     return rows;
   }
   function financial(state, filters = {}) {
@@ -271,6 +304,7 @@
       const name=typeof r.name==='string'?r.name.trim().toLowerCase():'';
       if(!name||names.has(name))errors.push(`${label} ${i+1} needs a unique name.`);names.add(name);
       textFields(r,['description'],`${label} ${i+1}`,errors);
+      if(r.archivedAt!==undefined&&r.archivedAt!==null&&(!validTimestamp(r.archivedAt)||!r.archivedAt.includes('T')))errors.push(`${label} ${i+1}: archivedAt must be an ISO timestamp with a timezone.`);
     });
     return ids;
   }
@@ -424,11 +458,11 @@
     if(kind==='asic'){
       state.asics=state.asics.filter(a=>a.id!==id);state.events=state.events.filter(e=>e.asicId!==id);
       state.projects.forEach(p=>{p.asicIds=p.asicIds.filter(a=>a!==id);if(p.leadTimes)delete p.leadTimes[id];});
-      if(state.pendingRequests)state.pendingRequests=state.pendingRequests.filter(r=>r.asicId!==id);
+      if(state.pendingRequests)state.pendingRequests=state.pendingRequests.filter(r=>r?.asicId!==id);
     }else if(kind==='project'){
       state.projects=state.projects.filter(p=>p.id!==id);state.events=state.events.filter(e=>e.projectId!==id);
       state.projects.forEach(p=>{if(p.parentId===id)p.parentId='';});
-      if(state.pendingRequests)state.pendingRequests=state.pendingRequests.filter(r=>r.projectId!==id);
+      if(state.pendingRequests)state.pendingRequests=state.pendingRequests.filter(r=>r?.projectId!==id);
     }else if(kind==='projectFamily'){state.projectFamilies=state.projectFamilies.filter(f=>f.id!==id);
     }else if(kind==='businessEntity'){
       state.businessEntities=state.businessEntities.filter(x=>x.id!==id);
@@ -439,5 +473,5 @@
     }
     return impact;
   }
-  window.Tracker={VERSION,TYPES,clone,freshSeed,inheritFamilyLinks,stats,weekly,financial,priceAt,parentName,matchesEvent,isoWeek,monday,quarterOf,isDate,todayPacific,requestShipBy,requestAvailability,allocationShipBy,allocationRows,supplyRows,supplySummary,validateState,deletionImpact,deleteEntity,entityName,fundingName,eventLabel:type=>labels[type]||type,calculations:(state,filters={})=>({...stats(state,filters),weekly:weekly(state,filters),financial:financial(state,filters)})};
+  window.Tracker={VERSION,TYPES,clone,freshSeed,inheritFamilyLinks,stats,weekly,financial,priceAt,parentName,matchesEvent,isoWeek,monday,quarterOf,isDate,todayPacific,requestShipBy,resolveRequest,requestAvailability,allocationShipBy,allocationRows,supplyRows,supplySummary,validateState,deletionImpact,deleteEntity,entityName,fundingName,eventLabel:type=>labels[type]||type,calculations:(state,filters={})=>({...stats(state,filters),weekly:weekly(state,filters),financial:financial(state,filters)})};
 })();

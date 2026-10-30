@@ -8,9 +8,10 @@ from urllib.parse import urlsplit
 import logging
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import create_engine, event as sqlalchemy_event, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
@@ -19,7 +20,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .auth import Actor, actor_for_request, require_editor
 from .config import Settings
-from .domain import DomainError, requires_admin, validate_transition, validate_workspace
+from .domain import INVALID_TEXT, DomainError, requires_admin, validate_transition, validate_workspace
 from .planning import allocation_plan, today_pacific, valid_date
 from . import repository
 
@@ -33,6 +34,15 @@ class WorkspaceWrite(BaseModel):
     state: dict
     reason: str = Field(default="Update workspace", min_length=1, max_length=200)
     operation: Literal["edit", "restore", "reset", "import"] = "edit"
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def normalize_reason(cls, value):
+        if isinstance(value, str):
+            if INVALID_TEXT.search(value):
+                raise ValueError("reason must contain valid Unicode without null characters.")
+            return value.strip()
+        return value
 
 
 class BodyLimitMiddleware:
@@ -110,8 +120,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def security_headers(request: Request, call_next):
         if request.method in {"PUT", "POST", "PATCH", "DELETE"}:
             origin = request.headers.get("origin")
-            if origin and urlsplit(origin).netloc.lower() != request.headers.get("host", "").lower():
-                return JSONResponse({"detail": {"code": "cross_origin_write", "message": "Cross-origin writes are not allowed."}}, status_code=403)
+            if origin:
+                try:
+                    origin_host = urlsplit(origin).netloc.lower()
+                except ValueError:
+                    origin_host = ""
+                if not origin_host or origin_host != request.headers.get("host", "").lower():
+                    return JSONResponse({"detail": {"code": "cross_origin_write", "message": "Cross-origin writes are not allowed."}}, status_code=403)
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
@@ -123,6 +138,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.exception_handler(DomainError)
     async def domain_error(request: Request, error: DomainError):
         return JSONResponse({"detail": {"code": "invalid_workspace", "message": str(error), "errors": error.errors}}, status_code=422)
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_error(request: Request, error: RequestValidationError):
+        # Do not echo arbitrary input/exception context back through JSONResponse:
+        # NaN or an unpaired surrogate in invalid input can itself break its
+        # serializer, turning a normal validation failure into HTTP 500.
+        def safe_text(value):
+            return value.encode("utf-8", errors="backslashreplace").decode("utf-8") if isinstance(value, str) else value
+        details = [{"type": safe_text(item["type"]), "loc": [safe_text(part) for part in item["loc"]],
+                    "msg": safe_text(item["msg"])} for item in error.errors()]
+        return JSONResponse({"detail": details}, status_code=422)
 
     @app.exception_handler(repository.RevisionConflict)
     async def revision_error(request: Request, error):

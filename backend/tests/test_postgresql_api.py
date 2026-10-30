@@ -1,6 +1,7 @@
 """HTTP integration against real Alembic migrations in a disposable PG schema."""
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+import hashlib
 import os
 from pathlib import Path
 from threading import Barrier
@@ -116,3 +117,24 @@ def test_concurrent_http_writers_receive_conflict_without_losing_winner(migrated
     assert final["revision"] == 2
     assert final["state"]["projects"][0]["name"] == "Project " + winner
     assert final["state"]["audit"][-1]["actor"] == winner
+
+
+@pytest.mark.postgres
+def test_indexed_text_bounds_return_validation_errors_without_database_failure(migrated_api, workspace):
+    app, client = migrated_api
+    incompressible = "".join(hashlib.sha256(str(index).encode()).hexdigest() for index in range(160))
+    workspace["projects"][0]["key"] = incompressible[:2000]
+    workspace["asics"][0]["parts"][0]["mpn"] = incompressible[-2000:]
+    response = client.put("/api/workspace", headers=headers(), json={"revision": 0, "state": workspace})
+    assert response.status_code == 200, response.text
+    saved = response.json()
+    for collection, field in (("projects", "key"), ("asics", "mpn")):
+        changed = deepcopy(saved["state"])
+        target = changed[collection][0]
+        if collection == "asics":
+            target = target["parts"][0]
+        target[field] = incompressible
+        response = client.put("/api/workspace", headers=headers(), json={"revision": saved["revision"], "state": changed})
+        assert response.status_code == 422, response.text
+        assert response.json()["detail"]["code"] == "invalid_workspace"
+        assert client.get("/api/workspace", headers=headers()).json() == saved

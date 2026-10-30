@@ -23,6 +23,35 @@ def test_family_mapping_is_never_invented(workspace):
         validate_workspace(workspace)
 
 
+@pytest.mark.parametrize("value", ["   ", "\t", "  project-key  "])
+def test_optional_project_keys_are_trimmed_consistently(workspace, value):
+    workspace["projects"][0]["key"] = value
+    assert validate_workspace(workspace)["projects"][0]["key"] == value.strip()
+
+
+@pytest.mark.parametrize("value", ["k" * 2001, "😀" * 501])
+def test_project_keys_are_bounded_by_utf8_index_size(workspace, value):
+    workspace["projects"][0]["key"] = value
+    with pytest.raises(DomainError, match="project key.*UTF-8 bytes"):
+        validate_workspace(workspace)
+
+
+@pytest.mark.parametrize("value", ["m" * 2001, "😀" * 501, "İ" * 667])
+def test_part_mpns_are_bounded_after_lowercase_utf8_expansion(workspace, value):
+    workspace["asics"][0]["parts"][0]["mpn"] = value
+    with pytest.raises(DomainError, match="part MPN.*UTF-8 bytes"):
+        validate_workspace(workspace)
+
+
+def test_index_bounds_do_not_limit_unindexed_descriptions(workspace):
+    workspace["projects"][0]["key"] = "k" * 2000
+    workspace["asics"][0]["parts"][0]["mpn"] = "😀" * 500
+    workspace["asics"][0]["description"] = "Long description " * 1000
+    result = validate_workspace(workspace)
+    assert len(result["projects"][0]["key"]) == 2000
+    assert result["asics"][0]["description"] == workspace["asics"][0]["description"]
+
+
 def test_parent_cycle_rejected(workspace):
     child = deepcopy(workspace["projects"][0])
     child.update(id="child", name="Child", parentId="p")
@@ -37,6 +66,28 @@ def test_invalid_prices_rejected_without_rounding(workspace, price):
     workspace["asics"][0]["price"] = price
     with pytest.raises(DomainError):
         validate_workspace(workspace)
+
+
+def test_very_large_integer_price_is_a_validation_error(workspace):
+    workspace["asics"][0]["price"] = 10**500
+    with pytest.raises(DomainError, match="price"):
+        validate_workspace(workspace)
+
+
+@pytest.mark.parametrize("value", ["bad\x00text", "bad\ud800text", "bad\udffftext"])
+def test_postgresql_incompatible_unicode_is_rejected_in_text_and_metadata(workspace, value):
+    workspace["asics"][0]["name"] = value
+    with pytest.raises(DomainError, match="valid Unicode"):
+        validate_workspace(workspace)
+    workspace["asics"][0]["name"] = "ASIC A"
+    workspace["source"] = {value: "metadata"}
+    with pytest.raises(DomainError, match="valid Unicode"):
+        validate_workspace(workspace)
+
+
+def test_valid_non_ascii_and_astral_unicode_remain_supported(workspace):
+    workspace["asics"][0]["name"] = "ASIC 研发 😀"
+    assert validate_workspace(workspace)["asics"][0]["name"] == "ASIC 研发 😀"
 
 
 def test_part_ids_must_be_unique_globally(workspace):
@@ -107,12 +158,81 @@ def test_shipped_allocation_cannot_move_or_reduce(workspace, event):
         validate_transition(workspace, after, as_of="2026-10-29")
 
 
+def test_allocation_shipped_floor_includes_linked_units_beyond_request_quantity(workspace, event):
+    workspace["events"] = [event("supply", "expected_ship", 100, "2026-10-01", supplyStatus="available"),
+        event("request", "request", 20, "2026-10-10", requestId="human-reference"),
+        event("allocation", "expected_fulfilment", 100, "2026-10-10", requestId="request", availableShipDate="2026-10-10"),
+        event("shipment", "actual_ship", 100, "2026-10-10", requestId="human-reference")]
+    unchanged = deepcopy(workspace)
+    validate_transition(workspace, unchanged, as_of="2026-10-29")
+    reduced = deepcopy(workspace)
+    reduced["events"][2]["qty"] = 99
+    with pytest.raises(DomainError, match="100 already shipped units"):
+        validate_transition(workspace, reduced, as_of="2026-10-29")
+
+
 def test_new_allocation_cannot_claim_prior_shipments(workspace, event):
     workspace["events"] = [event("r", "request", 20, "2026-10-10"), event("ship", "actual_ship", 4, "2026-10-10")]
     after = deepcopy(workspace)
     after["events"].append(event("new-allocation", "expected_fulfilment", 16, "2026-10-12"))
     result = validate_transition(workspace, after, as_of="2026-10-29")
     assert result["events"][-1]["priorShipmentIds"] == ["ship"]
+
+
+def test_new_allocation_cannot_pre_exclude_future_shipments(workspace, event):
+    workspace["events"] = [event("r", "request", 20, "2026-11-10"), event("future", "actual_ship", 4, "2026-11-01")]
+    after = deepcopy(workspace)
+    after["events"].append(event("new", "expected_fulfilment", 10, "2026-11-01", priorShipmentIds=["future", "client-only"]))
+    result = validate_transition(workspace, after, as_of="2026-10-29")
+    assert result["events"][-1]["priorShipmentIds"] == []
+
+
+def test_allocation_alias_can_normalize_to_the_same_exact_request_id(workspace, event):
+    # Earlier alias collision is deliberately first in the submitted array.
+    workspace["events"] = [event("earlier", "request", 20, "2026-11-01", requestId="target"),
+        event("target", "request", 20, "2026-11-10", requestId="target-alias"),
+        event("allocation", "expected_fulfilment", 10, "2026-11-01", requestId="target-alias")]
+    after = deepcopy(workspace)
+    after["events"][-1]["requestId"] = "target"
+    validate_transition(workspace, after, as_of="2026-10-29")
+
+
+def test_legacy_duplicate_alias_normalization_follows_deadline_fifo(workspace, event):
+    workspace["events"] = [event("later", "request", 20, "2026-11-10", requestId="legacy-alias"),
+        event("earlier", "request", 20, "2026-11-01", requestId="legacy-alias"),
+        event("allocation", "expected_fulfilment", 10, "2026-11-01", requestId="legacy-alias")]
+    after = deepcopy(workspace)
+    after["events"][-1]["requestId"] = "earlier"
+    validate_transition(workspace, after, as_of="2026-10-29")
+
+
+def test_duplicate_alias_normalization_uses_actual_timestamp_chronology(workspace, event):
+    workspace["events"] = [event("earlier", "request", 20, "2026-11-10", requestId="legacy-alias", createdAt="2026-10-29T12:00:00+02:00"),
+        event("later", "request", 20, "2026-11-10", requestId="legacy-alias", createdAt="2026-10-29T11:30:00Z"),
+        event("allocation", "expected_fulfilment", 10, "2026-11-01", requestId="legacy-alias")]
+    after = deepcopy(workspace)
+    after["events"][-1]["requestId"] = "earlier"
+    validate_transition(workspace, after, as_of="2026-10-29")
+
+
+def test_deleting_aliased_request_retains_the_historical_allocation_reference(workspace, event):
+    workspace["events"] = [event("request", "request", 20, "2026-11-10", requestId="human-alias"),
+        event("allocation", "expected_fulfilment", 10, "2026-11-01", requestId="human-alias")]
+    after = deepcopy(workspace)
+    after["events"] = after["events"][1:]
+    validate_transition(workspace, after, as_of="2026-10-29")
+    assert after["events"][0]["requestId"] == "human-alias"
+
+
+def test_request_alias_edit_cannot_silently_reassign_an_allocation(workspace, event):
+    workspace["events"] = [event("request", "request", 20, "2026-11-10", requestId="human-alias"),
+        event("other", "request", 20, "2026-11-10", requestId="other-alias"),
+        event("allocation", "expected_fulfilment", 10, "2026-11-01", requestId="human-alias")]
+    after = deepcopy(workspace)
+    after["events"][0]["requestId"] = "changed-alias"
+    after["events"][1]["requestId"] = "human-alias"
+    with pytest.raises(DomainError, match="original assignment"):
+        validate_transition(workspace, after, as_of="2026-10-29")
 
 
 def test_import_preserves_existing_historical_baselines(workspace, event):
@@ -133,6 +253,13 @@ def test_project_prototype_boolean_is_safe_and_nested_object_is_rejected(workspa
 
 @pytest.mark.parametrize("stamp", ["0001-01-01T00:00:00Z", "9999-12-31T23:59:59-14:00"])
 def test_timestamp_timezone_conversion_stays_within_supported_calendar(workspace, event, stamp):
+    workspace["events"] = [event("r", "request", 1, "2026-11-01", createdAt=stamp)]
+    with pytest.raises(DomainError, match="valid ISO timestamp"):
+        validate_workspace(workspace)
+
+
+@pytest.mark.parametrize("stamp", ["2026-10-29T12:00:00+01:60", "2026-10-29T12:00:00+00:99", "2026-10-29T12:00:00-02:75"])
+def test_non_iso_timezone_offsets_are_not_silently_normalized(workspace, event, stamp):
     workspace["events"] = [event("r", "request", 1, "2026-11-01", createdAt=stamp)]
     with pytest.raises(DomainError, match="valid ISO timestamp"):
         validate_workspace(workspace)
@@ -197,3 +324,16 @@ def test_recovery_point_verifies_prior_server_state_and_is_frozen(workspace):
         validate_transition(before, forged)
     with pytest.raises(DomainError, match="immutable"):
         validate_transition(after, forged)
+
+
+@pytest.mark.parametrize("source", [{}, [], None, False, 0, ""])
+def test_snapshot_source_metadata_matches_browser_truthiness(workspace, source):
+    workspace["source"] = source
+    before = validate_workspace(workspace)
+    captured = deepcopy(before)
+    captured.pop("snapshots")
+    if not isinstance(source, (dict, list)) and not source:
+        captured.pop("source")
+    after = deepcopy(before)
+    after["snapshots"] = [{"id": "snapshot", "date": "2026-10-29", "label": "Before edit", "data": captured}]
+    validate_transition(before, validate_workspace(after))

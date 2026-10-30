@@ -42,6 +42,24 @@ CSV_COLUMNS = [
 ]
 
 
+def _csv_literal(value: str) -> str:
+    """Keep exported backup text from becoming an Excel/Sheets formula."""
+    return "'" + value if value.lstrip().startswith(("=", "+", "-", "@")) or value.startswith(("\t", "\r", "\n")) else value
+
+
+def _csv_identifier(value: str) -> str:
+    # IDs cannot contain apostrophes. Decode only our exact escaped spelling of
+    # a valid identifier, never strip an arbitrary user-provided apostrophe.
+    literal = value[1:] if value.startswith("'") else value
+    return literal if valid_id(literal) and _csv_literal(literal) == value else value
+
+
+def _matches_csv_text(value: str, original: str) -> bool:
+    # Match against the known backup value rather than blindly unescaping text:
+    # an original name that intentionally begins with an apostrophe stays intact.
+    return value in {original.strip(), _csv_literal(original).strip(), _csv_literal(original.strip())}
+
+
 def _masters(state: dict, collection: str) -> dict:
     if not isinstance(state, dict):
         raise ValueError("Backup must be a workspace JSON object.")
@@ -60,7 +78,10 @@ def _prior_ownership(project: dict, state: dict, field: str, collection: str, la
         if not isinstance(identifier, str):
             raise ValueError(f"Project {project['id']}: {field} must be text.")
         return identifier, str(masters.get(identifier, {}).get("name", project.get(label, "")))
-    families = {row["id"]: row for row in state.get("projectFamilies", []) if isinstance(row, dict) and valid_id(row.get("id"))}
+    family_rows = state.get("projectFamilies", [])
+    if not isinstance(family_rows, list):
+        raise ValueError("projectFamilies must be an array when resolving prior family ownership.")
+    families = {row["id"]: row for row in family_rows if isinstance(row, dict) and valid_id(row.get("id"))}
     family = families.get(project.get("projectFamilyId"), {}) if isinstance(project.get("projectFamilyId"), str) else {}
     if family.get(field):
         identifier = family[field]
@@ -105,6 +126,9 @@ def convert_backup(payload: dict, mapping_rows: list[dict[str, str]]) -> tuple[d
         if not isinstance(raw, dict) or any(value is not None and not isinstance(value, str) for value in raw.values()):
             raise ValueError(f"CSV row {index}: every cell must be text.")
         row = {key: (raw.get(key) or "").strip() for key in CSV_COLUMNS}
+        for key in CSV_COLUMNS:
+            if key.endswith("_id"):
+                row[key] = _csv_identifier(row[key])
         if not any(row.values()):
             continue
         project_id = row["current_project_id"]
@@ -113,7 +137,7 @@ def convert_backup(payload: dict, mapping_rows: list[dict[str, str]]) -> tuple[d
         if project_id in reviewed:
             raise ValueError(f"CSV row {index}: duplicate mapping for project {project_id}.")
         project = projects[project_id]
-        if row["current_project_name"] and row["current_project_name"] != project.get("name"):
+        if row["current_project_name"] and not _matches_csv_text(row["current_project_name"], project["name"]):
             raise ValueError(f"Project {project_id}: current_project_name does not match this backup.")
         if not row["approved_by"] or not valid_date(row["approval_date"]):
             raise ValueError(f"Project {project_id}: approved_by and a valid YYYY-MM-DD approval_date are required.")
@@ -124,7 +148,7 @@ def convert_backup(payload: dict, mapping_rows: list[dict[str, str]]) -> tuple[d
         if target_business not in business or target_funding not in funding:
             raise ValueError(f"Project {project_id}: family ownership IDs must reference existing business/funding masters.")
         for field, expected in (("family_business_entity_name", business[target_business].get("name")), ("family_funding_source_name", funding[target_funding].get("name"))):
-            if row[field] and row[field] != expected:
+            if row[field] and not _matches_csv_text(row[field], expected):
                 raise ValueError(f"Project {project_id}: {field} does not match its master ID.")
         old_business, _ = _prior_ownership(project, state, "businessEntityId", "businessEntities", "entity")
         old_funding, _ = _prior_ownership(project, state, "fundingSourceId", "fundingSources", "funding")
@@ -134,7 +158,9 @@ def convert_backup(payload: dict, mapping_rows: list[dict[str, str]]) -> tuple[d
         if (old_business != target_business or old_funding != target_funding) and not row["resolution_notes"]:
             raise ValueError(f"Project {project_id}: changed or unknown prior ownership requires resolution_notes.")
         existing = families.get(family_id)
-        if existing is not None and (existing.get("name") != family_name or existing.get("businessEntityId") != target_business or existing.get("fundingSourceId") != target_funding):
+        if existing is not None and _matches_csv_text(family_name, existing["name"]):
+            family_name = existing["name"].strip()
+        if existing is not None and (existing["name"].strip() != family_name or existing.get("businessEntityId") != target_business or existing.get("fundingSourceId") != target_funding):
             raise ValueError(f"Project {project_id}: family {family_id} has inconsistent name or ownership across reviewed rows/existing records.")
         if existing is None:
             existing = {"id": family_id, "name": family_name, "businessEntityId": target_business, "fundingSourceId": target_funding, "description": ""}
@@ -204,7 +230,7 @@ def main(argv: list[str] | None = None) -> int:
             stream = io.StringIO(newline="")
             writer = csv.DictWriter(stream, fieldnames=CSV_COLUMNS)
             writer.writeheader()
-            writer.writerows(review_template_rows(payload))
+            writer.writerows({key: _csv_literal(value) for key, value in row.items()} for row in review_template_rows(payload))
             _write_files({args.output: stream.getvalue()}, protected={args.input}, force=args.force)
             print(f"Review template written: {args.output}")
         else:

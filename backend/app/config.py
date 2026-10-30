@@ -2,9 +2,42 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
+
+
+class _FrontendReferences(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.references: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        if tag == "script" and attributes.get("src"):
+            self.references.append(attributes["src"])
+        elif tag == "link" and "stylesheet" in (attributes.get("rel") or "").split() and attributes.get("href"):
+            self.references.append(attributes["href"])
+
+
+def _validate_frontend(directory: Path) -> None:
+    root = directory.resolve()
+    if not root.is_dir() or not (root / "index.html").is_file():
+        raise ValueError("FRONTEND_DIR must be a directory containing index.html.")
+    references = _FrontendReferences()
+    try:
+        references.feed((root / "index.html").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError) as error:
+        raise ValueError("FRONTEND_DIR index.html must be readable UTF-8 text.") from error
+    for reference in references.references:
+        parsed = urlsplit(reference)
+        if parsed.scheme or parsed.netloc:
+            continue
+        asset = (root / unquote(parsed.path).lstrip("/")).resolve()
+        if not asset.is_relative_to(root) or not asset.is_file():
+            raise ValueError(f"FRONTEND_DIR is missing a referenced JavaScript/CSS asset: {reference}")
 
 
 def _secret(name: str, default: str = "") -> str:
@@ -67,4 +100,6 @@ class Settings:
             raise ValueError("TRUSTED_HOSTS must list explicit permitted hosts.")
         if not 1024 <= self.max_body_bytes <= 32 * 1024 * 1024:
             raise ValueError("MAX_BODY_BYTES must be between 1024 and 33554432.")
+        if self.frontend_dir is not None:
+            _validate_frontend(Path(self.frontend_dir))
 

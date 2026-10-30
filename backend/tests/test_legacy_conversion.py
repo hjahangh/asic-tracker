@@ -135,3 +135,70 @@ def test_prior_template_header_is_compatible():
     path = SCRIPT.parent / "project-family-mapping-template.csv"
     with path.open(encoding="utf-8-sig", newline="") as stream:
         assert next(csv.reader(stream)) == converter.CSV_COLUMNS
+
+
+@pytest.mark.parametrize("keep_existing_family", [False, True])
+def test_template_can_convert_valid_whitespace_padded_live_names(workspace, keep_existing_family):
+    source = deepcopy(workspace) if keep_existing_family else legacy_state(workspace)
+    source["projects"][0]["name"] = " Project "
+    source["businessEntities"][0]["name"] = " Business "
+    source["fundingSources"][0]["name"] = " Funding "
+    if keep_existing_family:
+        source["projectFamilies"][0]["name"] = " Family "
+    rows = reviewed_rows(source)
+    rows[0].update(family_business_entity_name=" Business ", family_funding_source_name=" Funding ")
+    converted, _ = converter.convert_backup(source, rows)
+    assert converted["projects"][0]["name"] == "Project"
+    assert converted["businessEntities"][0]["name"] == "Business"
+    assert converted["fundingSources"][0]["name"] == "Funding"
+    assert converted["projectFamilies"][0]["name"] == "Family"
+
+
+def test_template_rejects_malformed_family_collection_without_a_type_error(workspace):
+    source = deepcopy(workspace)
+    source["projectFamilies"] = None
+    with pytest.raises(ValueError, match="projectFamilies must be an array"):
+        converter.review_template_rows(source)
+
+
+@pytest.mark.parametrize("project_name", ['=HYPERLINK("https://example.invalid","demo")', "+Project", "-Project", "@Project", " \t=Project", "'=Intentional apostrophe"])
+def test_cli_formula_safe_template_roundtrips_original_names_keys_and_ids(tmp_path, workspace, project_name):
+    source = legacy_state(workspace)
+    source["projects"][0].update(id="-2-1", name=project_name, key="+1-1", businessEntityId="-business", fundingSourceId="-funding")
+    source["businessEntities"][0].update(id="-business", name="@Business")
+    source["fundingSources"][0].update(id="-funding", name="-Funding")
+    input_path, mapping_path, output_path = (tmp_path / name for name in ("original.json", "mapping.csv", "converted.json"))
+    input_path.write_text(json.dumps(source))
+    assert converter.main([str(input_path), "--template", "--output", str(mapping_path)]) == 0
+    with mapping_path.open(newline="") as stream:
+        row = next(csv.DictReader(stream))
+    for field in ("current_project_id", "current_project_key", "current_business_entity_id", "current_business_entity_name", "current_funding_source_id", "current_funding_source_name"):
+        assert row[field].startswith("'")
+        assert not row[field].lstrip().startswith(("=", "+", "-", "@"))
+    assert row["current_project_name"] == (project_name if project_name.startswith("'") else "'" + project_name)
+    row.update(proposed_project_family_id="family", proposed_project_family_name="Family",
+        family_business_entity_id=row["current_business_entity_id"], family_business_entity_name=row["current_business_entity_name"],
+        family_funding_source_id=row["current_funding_source_id"], family_funding_source_name=row["current_funding_source_name"],
+        approved_by="Reviewer", approval_date="2026-10-29")
+    with mapping_path.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=converter.CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerow(row)
+    assert converter.main([str(input_path), "--mapping", str(mapping_path), "--output", str(output_path)]) == 0
+    converted = json.loads(output_path.read_text())
+    assert converted["projects"][0]["id"] == "-2-1"
+    assert converted["projects"][0]["name"] == project_name.strip()
+    assert converted["projects"][0]["key"] == "+1-1"
+    assert converted["projects"][0]["businessEntityId"] == "-business"
+    assert converted["businessEntities"][0]["name"] == "@Business"
+    assert converted["fundingSources"][0]["name"] == "-Funding"
+
+
+@pytest.mark.parametrize("original_name", ["=Existing family", "'=Intentional family"])
+def test_escaped_existing_family_label_does_not_add_or_remove_intentional_apostrophe(workspace, original_name):
+    source = deepcopy(workspace)
+    source["projectFamilies"][0]["name"] = original_name
+    rows = reviewed_rows(source)
+    rows[0]["proposed_project_family_name"] = converter._csv_literal(original_name)
+    converted, _ = converter.convert_backup(source, rows)
+    assert converted["projectFamilies"][0]["name"] == original_name

@@ -78,11 +78,14 @@ Free inventory forecast to cover a request does not create an allocation. Actual
 
 The frontend uses server calculations only when both the response revision and as-of date match its loaded workspace. Browser calculations support unsaved previews. The Python planner is independently tested against 122 synthetic cases captured from the demo's JavaScript regression suites.
 
+Within an ASIC/project, an exact request event ID takes precedence over a colliding legacy request alias. Shared legacy aliases retain FIFO behavior. Equal-deadline requests use actual creation-time order across timezone offsets, with missing/date-only history preserved, then a deterministic ID tie break shared by the browser and API. If an explicitly linked shipment exceeds its request quantity, excess units can close eligible dedicated allocation commitments without overstating request fulfillment or consuming another request's credited units.
+
 ## Data rules
 
 - Each project belongs to one project family. Each family has exactly one business entity and one funding source. Project ownership IDs and display labels are derived from its family on every write. Legacy projects require an explicit mapping; imports never guess families.
 - IDs remain stable. Part IDs are globally unique, project parent relationships cannot cycle, and referenced live records must exist. Quantities are positive safe whole numbers; totals cannot exceed JavaScript's safe integer range. Dates, transit days and calculated ship dates are bounded.
 - USD prices fit PostgreSQL `NUMERIC(12,2)`: finite nonnegative values with at most two decimal places. The server rejects values requiring database rounding.
+- Indexed project keys and lowercase part MPNs are limited to 2,000 UTF-8 bytes to fit PostgreSQL indexes; master names remain limited to 500 characters. Descriptions are not subjected to these index limits. Text must be valid Unicode without NUL or unpaired surrogate characters.
 - Existing planning event types and allocation creation/baseline fields are immutable during normal edits. Allocation quantity cannot fall below already shipped units.
 - Saved forecast versions and recovery points are immutable during normal edits. New forecast lines must capture the current server-validated plan; new recovery data must capture the prior server workspace. Frozen forecast labels/IDs remain valid after live masters are deleted. Explicit administrator import/restore preserves reviewed historical records.
 - Normal writes ignore client audit additions, deletions and actor fields. The server appends a record with the authenticated actor, revision and before/after changes. Imported legacy entries are marked as legacy with an unknown original actor. PostgreSQL rejects audit updates/deletions.

@@ -83,6 +83,29 @@ def _extra(record: dict[str, Any], known: set[str]) -> dict[str, Any]:
     return _copy({key: value for key, value in record.items() if key not in known})
 
 
+def _asic_extra(record: dict[str, Any]) -> dict[str, Any]:
+    known = {"id", "name", "owner", "marketing", "price", "historicalPriceUnknown", "description",
+             "parts", "priceHistory", "archivedAt"}
+    if record.get("parts"):
+        # Structured variants are authoritative when present. Older backups may
+        # instead contain only flat lists/labels, whose pairings cannot be guessed.
+        known.update({"mpns", "cpns", "plid", "assembly", "subtype"})
+    return _extra(record, known)
+
+
+def _project_extra(record: dict[str, Any]) -> dict[str, Any]:
+    extra = _extra(record, {"id", "name", "key", "projectFamilyId", "manager", "scpm", "platform", "prototype",
+                            "parentId", "summary", "businessEntityId", "fundingSourceId", "entity", "funding",
+                            "asicIds", "leadTimes", "archivedAt"})
+    # Live association transit stays relational. Retain accepted legacy settings
+    # for unassociated ASICs until an explicit edit removes them.
+    unused_transit = {identifier: days for identifier, days in record.get("leadTimes", {}).items()
+                      if identifier not in record.get("asicIds", [])}
+    if unused_transit:
+        extra["leadTimes"] = unused_transit
+    return extra
+
+
 def _master_record(row: Any, identifier: str) -> dict[str, Any]:
     record = _copy(row.extra or {})
     record.update(id=getattr(row, identifier), name=row.name, description=row.description)
@@ -132,7 +155,7 @@ def get_workspace(session: Session, *, lock: bool = False) -> dict[str, Any]:
             businessEntityId=family.business_entity_id, fundingSourceId=family.funding_source_id,
             entity=entity_names[family.business_entity_id], funding=funding_names[family.funding_source_id],
             asicIds=[pair.asic_id for pair in pairs],
-            leadTimes={pair.asic_id: pair.shipping_time_days for pair in pairs},
+            leadTimes={**record.get("leadTimes", {}), **{pair.asic_id: pair.shipping_time_days for pair in pairs}},
         )
         if row.prototype is not None:
             record["prototype"] = row.prototype
@@ -160,9 +183,12 @@ def get_workspace(session: Session, *, lock: bool = False) -> dict[str, Any]:
         record.update(id=row.asic_id, name=row.asic_name,
                       owner=row.si_ops_supply_chain_project_manager, marketing=row.marketing_name,
                       description=row.description, price=None if row.unit_price is None else float(row.unit_price),
-                      parts=variants, priceHistory=history, mpns=unique("mpn"), cpns=unique("cpn"),
-                      plid=", ".join(unique("plid")), assembly=" | ".join(unique("assembly")),
-                      subtype=" | ".join(unique("subtype")))
+                      parts=variants, priceHistory=history,
+                      mpns=unique("mpn") if variants else record.get("mpns", []),
+                      cpns=unique("cpn") if variants else record.get("cpns", []),
+                      plid=", ".join(unique("plid")) if variants else record.get("plid", ""),
+                      assembly=" | ".join(unique("assembly")) if variants else record.get("assembly", ""),
+                      subtype=" | ".join(unique("subtype")) if variants else record.get("subtype", ""))
         if row.historical_price_unknown is not None:
             record["historicalPriceUnknown"] = row.historical_price_unknown
         if row.archived_at is not None:
@@ -311,8 +337,7 @@ def write_workspace(session: Session, state: dict[str, Any], *, expected_revisio
         marketing_name=value.get("marketing", ""), unit_price=_decimal(value.get("price")),
         historical_price_unknown=value.get("historicalPriceUnknown"), description=value.get("description", ""),
         archived_at=_timestamp(value.get("archivedAt")), position=index,
-        extra=_extra(value, {"id", "name", "owner", "marketing", "price", "historicalPriceUnknown", "description",
-                            "parts", "priceHistory", "mpns", "cpns", "plid", "assembly", "subtype", "archivedAt"}))
+        extra=_asic_extra(value))
         for index, value in enumerate(state["asics"])], ("asic_id",))
     stale[ProjectFamily] = _sync(session, ProjectFamily, [dict(
         project_family_id=value["id"], name=value["name"], business_entity_id=value["businessEntityId"],
@@ -326,9 +351,7 @@ def write_workspace(session: Session, state: dict[str, Any], *, expected_revisio
         supply_chain_program_manager=value.get("scpm", ""), platform=value.get("platform", ""),
         prototype=value.get("prototype"), parent_project_id=value.get("parentId") or None,
         description=value.get("summary", ""), archived_at=_timestamp(value.get("archivedAt")), position=index,
-        extra=_extra(value, {"id", "name", "key", "projectFamilyId", "manager", "scpm", "platform", "prototype",
-                            "parentId", "summary", "businessEntityId", "fundingSourceId", "entity", "funding",
-                            "asicIds", "leadTimes", "archivedAt"}))
+        extra=_project_extra(value))
         for index, value in enumerate(state["projects"])], ("project_id",))
     part_values, price_values, pair_values = [], [], []
     for asic in state["asics"]:
@@ -345,7 +368,7 @@ def write_workspace(session: Session, state: dict[str, Any], *, expected_revisio
     for project in state["projects"]:
         for index, asic_id in enumerate(project.get("asicIds", [])):
             pair_values.append(dict(project_id=project["id"], asic_id=asic_id, position=index,
-                                    shipping_time_days=project.get("leadTimes", {}).get(asic_id, project.get("leadDays", 7))))
+                                    shipping_time_days=project.get("leadTimes", {}).get(asic_id, project.get("leadDays") or 0)))
     stale[ASICPart] = _sync(session, ASICPart, part_values, ("part_id",))
     stale[ASICPriceHistory] = _sync(session, ASICPriceHistory, price_values, ("asic_id", "effective_quarter"))
     stale[ProjectASIC] = _sync(session, ProjectASIC, pair_values, ("project_id", "asic_id"))
@@ -415,7 +438,7 @@ def write_workspace(session: Session, state: dict[str, Any], *, expected_revisio
         detail.update(before=changes[0]["before"], after=changes[0]["after"])
     session.add(AuditEntry(audit_id="server-" + str(uuid.uuid4()), sequence=sequence + 1,
                            workspace_revision=meta.revision, occurred_at_text=_iso(datetime.now(timezone.utc)),
-                           action=(reason or "Update workspace")[:160],
+                           action=((reason or "").strip() or "Update workspace")[:200],
                            detail=json.dumps(detail, ensure_ascii=False, allow_nan=False, separators=(",", ":")),
                            actor_subject=actor["subject"], actor_display_name=actor.get("display_name"),
                            actor_role=actor.get("role"), is_legacy=False))

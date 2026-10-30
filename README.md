@@ -6,7 +6,7 @@ The frontend retains the demo's Cisco color scheme and views for Overview, ASICs
 
 ## Run locally
 
-Get the code and enter the repository directory. This is a private repository, so Git must be authenticated to an account with access:
+Get the code and enter the repository directory. For a private repository, Git must be authenticated to an account with access:
 
 ```sh
 git clone https://github.com/hjahangh/asic-tracker.git
@@ -90,22 +90,32 @@ python3 scripts/convert_legacy_backup.py /secure/old-backup.json --template --ou
 python3 scripts/convert_legacy_backup.py /secure/old-backup.json --mapping /secure/family-map.csv --output /secure/converted.json
 ```
 
-An administrator can import `converted.json` through Recovery. The converter preserves event IDs, shipment baselines, forecasts, and parts. It puts old recovery snapshots unchanged into `converted.legacy-recovery.json` and clears the live recovery list because deleted historical projects may lack a reviewed family assignment. Keep that sidecar and original backup securely; neither is uploaded to GitHub. Changes in ownership require resolution notes; every mapping requires an approver and approval date. No families are invented automatically.
+An administrator can import `converted.json` through Recovery. The converter preserves event IDs, shipment baselines, forecasts, and parts. It puts old recovery snapshots unchanged into `converted.legacy-recovery.json` and clears the live recovery list because deleted historical projects may lack a reviewed family assignment. Keep that sidecar, the original backup, and the approved family-map CSV securely; none belongs in GitHub. The CSV is the review/approval record and is not embedded in the imported workspace. Changes in ownership require resolution notes; every mapping requires an approver and approval date. No families are invented automatically.
 
 ## Development and tests
 
-Python 3.12 and Node.js 22+ are used for tests. There are no frontend package-install or build steps. From the repository root:
+Python 3.12 and Node.js 22+ are used for tests. There are no frontend package-install or build steps. The following commands use macOS/Linux shell syntax. From the repository root:
 
 ```sh
 python3.12 -m venv .venv
 .venv/bin/python -m pip install --require-hashes -r backend/requirements-dev.txt
 PYTHONPATH=backend .venv/bin/python -m pytest backend/tests -q
 node --test frontend/tests/*.test.cjs
+.venv/bin/python scripts/check_planners.py
 ```
+
+The planner check runs 3,000 deterministic stock/shipment conservation scenarios and 400 browser/API comparisons across four read models. It requires Node 22 or newer on `PATH`; use `--node /path/to/node` or `NODE_BINARY` to select another installed executable.
 
 For PostgreSQL tests, set `TEST_DATABASE_URL` to a **disposable test database**, using `postgresql+psycopg://...`. Tests create/drop isolated schemas and need permission to do so; never point them at the production database. Without it, repository tests use SQLite and PostgreSQL-only checks skip. CI supplies PostgreSQL 17 and runs migrations plus both test suites.
 
-For native development, apply `alembic upgrade head` from `backend/` with `DATABASE_URL` set, then start `uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload` with `AUTH_MODE=development`. Install runtime requirements in the active environment first. Normal production execution uses the container and proxy authentication.
+For native development, first create the virtual environment above and provide `DATABASE_URL` or `DATABASE_URL_FILE` for a dedicated development PostgreSQL database. From the repository root:
+
+```sh
+.venv/bin/python -m alembic -c backend/alembic.ini upgrade head
+AUTH_MODE=development PYTHONPATH=backend .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Open `http://127.0.0.1:8000`. These commands do not require activating the virtual environment. Normal production execution uses the container and proxy authentication.
 
 Update dependencies through `backend/pyproject.toml`, run `uv lock` in `backend/`, then regenerate both exports with `uv export --locked --no-dev --no-emit-project --format requirements-txt --output-file requirements.txt` and the same command with `--extra test --output-file requirements-dev.txt`. Review and commit the lock and exports together.
 
@@ -113,6 +123,8 @@ Update dependencies through `backend/pyproject.toml`, run `uv lock` in `backend/
 
 This release supports one shared planning workspace using a transactionally saved workspace document mapped into relational tables. Reads and writes briefly lock the revision row; concurrent stale writes return HTTP 409 and preserve the user's draft. It is suitable for a small internal team. Large workspaces or heavy concurrency call for entity-level APIs, paginated history, load testing, and measured database tuning before rollout. Retained audit/forecast history and up to 30 rotating recovery points grow the workspace payload; uploads default to 12 MiB. Audit/forecast history is never automatically truncated to fit that limit.
 
+Submitted workspaces allow at most 10,000 records per core planning collection, 100,000 audit entries, 120 saved monthly forecasts, and 50,000 lines per forecast. Backup files may be read up to 32 MiB, but the complete import request must still fit the server's configured body limit. Weekly reports show at most the latest 5,300 weeks, carry older demand/allocations into the opening balance, and display a notice when that window applies. Plan explicit archival or API changes before reaching these limits; do not erase audit records to work around them.
+
 Viewers can inspect/export. Editors can update planning records. Administrators manage families, delete records, and import/restore/reset. A transfer that removes an entire allocation also requires an administrator. Group access is application-wide, without per-business-entity row security. Allocations may be unbacked commitments and do not create stock; coverage and shortfalls remain visible separately.
 
-See [data model](docs/DATA_MODEL.md), [API](docs/API.md), [operations](docs/OPERATIONS.md), and [verification](docs/VERIFICATION.md). No license is assigned to the internal application source by this package; confirm ownership and distribution policy with the hosting team.
+See [data model](docs/DATA_MODEL.md), [API](docs/API.md), [operations](docs/OPERATIONS.md), [verification](docs/VERIFICATION.md), and [repository audit](docs/AUDIT.md). No license is assigned to the internal application source by this package; confirm ownership and distribution policy with the hosting team.

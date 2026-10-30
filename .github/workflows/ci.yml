@@ -53,6 +53,8 @@ jobs:
         run: python -m pytest backend/tests -q
       - name: Test JavaScript frontend
         run: node --test frontend/tests/*.test.cjs
+      - name: Check planner conservation and browser/API parity
+        run: python scripts/check_planners.py
 
   container:
     runs-on: ubuntu-latest

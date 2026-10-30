@@ -5,10 +5,11 @@
 ```mermaid
 flowchart LR
     U[User browser] -->|HTTPS| G[Internal TLS and SSO gateway]
-    G -->|Private upstream and verified identity headers| A[Application container]
-    subgraph A[Application container: nonroot Python process]
-      F[Static JavaScript frontend]
+    G -->|Private upstream and verified identity headers| P
+    subgraph APP["Application container: nonroot Python process"]
+      F[Static frontend assets]
       P[FastAPI Python API]
+      P -->|Serves| F
     end
     P -->|SQLAlchemy and psycopg; TLS in production| D[(PostgreSQL)]
     M[One-time Alembic migration job] -->|Schema owner credential| D
@@ -56,6 +57,8 @@ Forward the public `Host` and browser `Origin` unchanged through ingress. State-
 
 Create a dedicated PostgreSQL database and schema-owner/migration role. Create a distinct nonsuperuser runtime login role with no schema ownership, role management, or DDL privileges. Apply migrations with the schema-owner URL, then run `scripts/grant_runtime.sql` as the owner with the runtime role name. The script targets the tracker tables in the `public` schema; use a dedicated database and review it if adopting another schema.
 
+The source commands below assume a configured Python 3.12 environment with backend requirements installed. With the supplied containers, use the one-time migration service instead; the application runtime does not need a host Python installation.
+
 ```sh
 # The hosting secret mechanism supplies these URL variables; do not put passwords in shell history.
 cd backend
@@ -92,7 +95,7 @@ The production app runs read-only with a temporary `/tmp`, drops Linux capabilit
 | `PROXY_SHARED_SECRET` or `PROXY_SHARED_SECRET_FILE` | Required in proxy mode, at least 32 characters; use exactly one |
 | `ROLE_GROUPS` | JSON role-to-group arrays; see `.env.production.example` |
 | `TRUSTED_HOSTS` | Explicit comma-separated permitted hostnames; no `*` |
-| `FRONTEND_DIR` | `/app/frontend` inside the Docker image |
+| `FRONTEND_DIR` | `/app/frontend` inside the Docker image; startup checks the directory, index, and referenced local JS/CSS files |
 | `ENABLE_API_DOCS` | `false`; optional authenticated `/api/docs` and `/api/openapi.json` |
 | `MAX_BODY_BYTES` | `12582912` (12 MiB), supported 1 KiB–32 MiB |
 | `DEV_USER`, `DEV_ROLE` | Used only in development mode; defaults local-developer/admin |

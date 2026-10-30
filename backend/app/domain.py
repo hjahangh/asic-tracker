@@ -8,15 +8,17 @@ import json
 import math
 import re
 
-from .planning import PACIFIC, allocation_plan, allocation_ship_by, request_ship_by, today_pacific, valid_date
+from .planning import PACIFIC, allocation_plan, allocation_ship_by, creation_priority, matching_requests, request_ship_by, today_pacific, valid_date
 
 MAX_SAFE_INTEGER = 9_007_199_254_740_991
+MAX_INDEXED_TEXT_BYTES = 2_000
 CORE_COLLECTIONS = ("asics", "projects", "projectFamilies", "events", "businessEntities", "fundingSources")
 EVENT_TYPES = {"request", "expected_ship", "expected_fulfilment", "actual_ship", "actual_fulfilment"}
 ID = re.compile(r"^[A-Za-z0-9_-]+$")
 MONTH = re.compile(r"^(?!0000)[0-9]{4}-(?:0[1-9]|1[0-2])$")
 QUARTER = re.compile(r"^(?!0000)[0-9]{4}-Q[1-4]$")
-TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2}))?$")
+TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9]))?$")
+INVALID_TEXT = re.compile(r"[\x00\ud800-\udfff]")
 
 
 class DomainError(ValueError):
@@ -54,7 +56,7 @@ def integer(value: object, minimum: int = 0, maximum: int = MAX_SAFE_INTEGER) ->
 def price_valid(value: object, nullable: bool = True) -> bool:
     if value is None:
         return nullable
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or isinstance(value, float) and not math.isfinite(value):
         return False
     try:
         amount = Decimal(str(value))
@@ -67,6 +69,8 @@ def _safe_json(value: object, depth: int = 0, path: tuple = ()) -> None:
     if depth > 32:
         raise DomainError("Workspace nesting exceeds the supported limit.")
     if isinstance(value, dict):
+        if any(isinstance(key, str) and INVALID_TEXT.search(key) for key in value):
+            raise DomainError("Workspace text must be valid Unicode without null characters.")
         if any(key in {"__proto__", "constructor"} for key in value):
             raise DomainError("Workspace contains a reserved object key.")
         for key, item in value.items():
@@ -78,6 +82,10 @@ def _safe_json(value: object, depth: int = 0, path: tuple = ()) -> None:
             _safe_json(item, depth + 1, path + (index,))
     elif isinstance(value, float) and not math.isfinite(value):
         raise DomainError("Workspace numbers must be finite.")
+    elif isinstance(value, str) and INVALID_TEXT.search(value):
+        # PostgreSQL text/JSONB cannot store NUL or unpaired UTF-16 surrogates.
+        # Reject these as invalid input before a database error or UTF-8 encode.
+        raise DomainError("Workspace text must be valid Unicode without null characters.")
 
 
 def validate_workspace(payload: dict, *, _snapshot: bool = False) -> dict:
@@ -189,6 +197,10 @@ def validate_workspace(payload: dict, *, _snapshot: bool = False) -> dict:
             mpn = part.get("mpn", "")
             if not isinstance(mpn, str) or not mpn.strip():
                 errors.append(f"{label}: each populated part row needs an MPN.")
+            elif len(mpn.strip().lower().encode("utf-8")) > MAX_INDEXED_TEXT_BYTES:
+                # Leave room for the ASIC ID and PostgreSQL B-tree tuple
+                # overhead in the compound case-insensitive uniqueness index.
+                errors.append(f"{label}: each part MPN must fit within {MAX_INDEXED_TEXT_BYTES} UTF-8 bytes after lowercase normalization.")
             elif mpn.strip().casefold() in mpns:
                 errors.append(f"{label}: part MPNs must be unique within this ASIC.")
             else:
@@ -211,8 +223,11 @@ def validate_workspace(payload: dict, *, _snapshot: bool = False) -> dict:
             project.update(businessEntityId=family["businessEntityId"], fundingSourceId=family["fundingSourceId"],
                 entity=business[family["businessEntityId"]]["name"], funding=funding[family["fundingSourceId"]]["name"])
         key = project.get("key", "")
-        if isinstance(key, str) and key.strip():
+        if isinstance(key, str):
             project["key"] = key.strip()
+        if isinstance(key, str) and project["key"]:
+            if len(project["key"].encode("utf-8")) > MAX_INDEXED_TEXT_BYTES:
+                errors.append(f"{label}: project key must fit within {MAX_INDEXED_TEXT_BYTES} UTF-8 bytes.")
             if project["key"] in keys:
                 errors.append(f"{label}: project key must be unique when set.")
             keys.add(project["key"])
@@ -402,6 +417,16 @@ def validate_transition(before: dict, after: dict, *, operation: str = "edit", a
     new_events = {event["id"]: event for event in after["events"]}
     shipped = {row["eventId"]: row["shippedQty"] for row in allocation_plan(before, as_of)["allocations"]}
     completed_before = {event["id"] for event in before.get("events", []) if event["type"] == "actual_ship" and event["date"] <= as_of}
+    requests_before = sorted((event for event in before.get("events", []) if event["type"] == "request"),
+        key=lambda event: (request_ship_by(event), creation_priority(event.get("createdAt", "")), event["id"]))
+    requests_after = sorted((event for event in after["events"] if event["type"] == "request"),
+        key=lambda event: (request_ship_by(event), creation_priority(event.get("createdAt", "")), event["id"]))
+    remaining_request_ids = {event["id"] for event in requests_after}
+
+    def bound_request(record: dict, requests: list[dict]) -> str | None:
+        matches = matching_requests(requests, record.get("requestId", ""), record["asicId"], record["projectId"], identifier_key="id")
+        return matches[0]["id"] if matches else None
+
     errors = []
     for identifier, event in new_events.items():
         old = old_events.get(identifier)
@@ -413,13 +438,14 @@ def validate_transition(before: dict, after: dict, *, operation: str = "edit", a
             count = shipped.get(identifier, 0)
             if event["qty"] < count:
                 errors.append(f"Allocation {identifier}: quantity cannot be below {count} already shipped units.")
-            def canonical(record: dict, state: dict) -> str:
-                reference = record.get("requestId", "")
-                request = next((candidate for candidate in state["events"] if candidate["type"] == "request"
-                    and candidate["asicId"] == record["asicId"] and candidate["projectId"] == record["projectId"]
-                    and reference and reference in (candidate["id"], candidate.get("requestId"))), None)
-                return request["id"] if request else reference
-            if old["asicId"] != event["asicId"] or old["projectId"] != event["projectId"] or canonical(old, before) != canonical(event, after):
+            old_reference, new_reference = old.get("requestId", ""), event.get("requestId", "")
+            old_bound, new_bound = bound_request(old, requests_before), bound_request(event, requests_after)
+            # Retain a deleted request's literal historical reference, just as
+            # an exact-ID link already does. Do not let alias edits silently
+            # reassign allocations to another still-live request.
+            deleted_link = old_reference == new_reference and old_bound is not None and old_bound not in remaining_request_ids and new_bound is None
+            reassigned = (old_bound or old_reference) != (new_bound or new_reference) and not deleted_link
+            if old["asicId"] != event["asicId"] or old["projectId"] != event["projectId"] or reassigned:
                 errors.append(f"Allocation {identifier}: units must remain with their original assignment; use Reallocate to create a new allocation with a fresh shipment baseline.")
             # A caller cannot rewrite shipment credit or creation priority on an
             # existing allocation by modifying hidden fields.
@@ -428,7 +454,9 @@ def validate_transition(before: dict, after: dict, *, operation: str = "edit", a
             if old.get("createdAt", "") != event.get("createdAt", ""):
                 errors.append(f"Allocation {identifier}: creation timestamp is immutable.")
         else:
-            event["priorShipmentIds"] = sorted(set(event.get("priorShipmentIds", [])) | completed_before)
+            # Only completed, previously stored shipments establish a new
+            # allocation's baseline. A client cannot pre-exclude future units.
+            event["priorShipmentIds"] = sorted(completed_before)
     # History may reference masters that were later removed. Preserve its frozen
     # labels and quantities, while verifying new captures against the live plan.
     old_versions = {version["id"]: version for version in before.get("forecastVersions", [])}
@@ -453,7 +481,10 @@ def validate_transition(before: dict, after: dict, *, operation: str = "edit", a
         else:
             if previous_data is None:
                 previous_data = deepcopy({key: before[key] for key in (*CORE_COLLECTIONS, "audit", "forecastVersions", "pendingRequests") if key in before})
-                if before.get("source"):
+                # Empty JSON objects/arrays are truthy in the browser and are
+                # included by its snapshot capture; retain that compatibility
+                # metadata rather than rejecting the otherwise exact capture.
+                if before.get("source") or isinstance(before.get("source"), (dict, list)):
                     previous_data["source"] = deepcopy(before["source"])
                 previous_data = validate_workspace(previous_data, _snapshot=True)
             if snapshot["data"] != previous_data:
