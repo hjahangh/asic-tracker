@@ -6,21 +6,56 @@ The frontend retains the demo's Cisco color scheme and views for Overview, ASICs
 
 ## Run locally
 
-Requires Python 3 for the setup helper and Docker Engine/Desktop with Docker Compose v2.
+Get the code and enter the repository directory. This is a private repository, so Git must be authenticated to an account with access:
+
+```sh
+git clone https://github.com/hjahangh/asic-tracker.git
+cd asic-tracker
+```
+
+Alternatively, sign in to GitHub, choose **Code → Download ZIP**, extract it, and open a terminal in the extracted folder containing `compose.yaml`.
+
+Install your organization's approved Docker Desktop on macOS or Windows, then start it and wait until the engine is running. On Linux, install and start Docker Engine with the Docker Compose plugin (v2 or newer). Python 3 is also required for the setup helper. Check these prerequisites from the repository directory:
+
+```sh
+python3 --version
+docker info
+docker compose version
+```
+
+On Windows PowerShell, use `py -3` instead of `python3`, and `curl.exe` instead of `curl` in the commands below.
+
+For the first start, generate the local credentials once, then build and start the services:
 
 ```sh
 python3 scripts/bootstrap_dev.py
 docker compose up --build --wait
 ```
 
-Open **http://localhost:8080**. The local setup uses an explicit development administrator identity; the app displays that identity. Onboarding order: Business Entity and Funding Source → Project Family → ASIC → Project → Request/Supply → Allocation.
+Check that the API is ready:
 
 ```sh
-docker compose logs -f app
+curl --fail http://localhost:8080/health/ready
+```
+
+It should return `{"status":"ready"}`. Open **http://localhost:8080** in your browser. The local setup uses an explicit development administrator identity; the app displays that identity. Onboarding order: Business Entity and Funding Source → Project Family → ASIC → Project → Request/Supply → Allocation.
+
+To stop the services:
+
+```sh
 docker compose down
 ```
 
+To start again, run `docker compose up --build --wait` from the same directory. Skip the bootstrap command when `.env` already exists; its refusal to overwrite that file is expected. Keep the existing credentials with the existing database volume.
+
 The named PostgreSQL volume survives `down`. Use `down -v` only when deliberately deleting this local development database. Production uses a separate configuration below.
+
+If startup fails:
+
+- **`docker: command not found` / missing `compose`:** install the approved Docker package and Compose plugin (v2 or newer), then reopen the terminal and repeat the prerequisite checks.
+- **Cannot connect to the Docker daemon:** start Docker Desktop or the Linux Docker service and wait for `docker info` to succeed.
+- **Port 8080 is already in use:** change `HTTP_PORT=8080` to `HTTP_PORT=8081` in `.env`, rerun the startup command, and use port 8081 in the browser and health-check URL.
+- **Migration failure or app not healthy:** inspect `docker compose ps -a` and `docker compose logs migrate app db`. Fix the reported issue and rerun startup; do not delete the volume or regenerate credentials as a first troubleshooting step.
 
 ## What to upload to GitHub
 
