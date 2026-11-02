@@ -36,6 +36,8 @@ The same application image serves the frontend and API on port 8000. MongoDB is 
 
 Use organization-approved base images or mirrors if public image registries are unavailable. Pin the approved application image by digest in the platform's release configuration. The supplied Dockerfile uses `python:3.12-slim`; local development uses `mongo:8.0`. The verified image resolved to MongoDB 8.0.34 on Ubuntu 24.04/kernel 6.8.0-142. The same image refused to start on Ubuntu 26.04/kernel 7.0.0-34 with its kernel compatibility guard. Validate the approved image and Docker host kernel together; this observed restriction must be reevaluated for later MongoDB/kernel patches. See the [upstream kernel/rseq issue](https://jira.mongodb.org/browse/SERVER-121912). Major tags receive updates, so the hosting pipeline should build, scan, and promote a specific tested digest.
 
+CI pins both jobs to `ubuntu-22.04` because its hosted image currently uses a compatible 6.8 kernel. GitHub's Ubuntu 24.04 image also moved to kernel 7.0, so selecting that OS label alone does not avoid the current MongoDB startup guard. Review the pin after a tested MongoDB/kernel upgrade and before the Ubuntu 22 runner retires. See [GitHub's runner image versions](https://github.com/actions/runner-images) and [Ubuntu 24 kernel update](https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20261026.354). This CI choice does not change the application container or production database requirements.
+
 ## Identity and access
 
 Production uses `AUTH_MODE=proxy`. The gateway must authenticate the person, strip all browser-supplied `X-Authenticated-*` and `X-Proxy-Token` headers, and inject:
